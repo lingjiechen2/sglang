@@ -14,6 +14,7 @@ from sglang.srt.speculative.dflash_utils import (
     build_speculative_verify_target_probs,
 )
 from sglang.srt.speculative.spec_utils import fast_sample
+from sglang.srt.speculative.uno_rectifier import UnoRectifier
 
 _SPARSE_TOP_K_LIMIT = 128
 
@@ -429,12 +430,21 @@ def sample_uno_candidates(
     sampling_info: Any,
     max_top_k: int,
     uniform_top_k_value: int | None = None,
+    rectifier: UnoRectifier | None = None,
 ) -> tuple[torch.Tensor, UnoDraftDistribution]:
     """Sample 1 clean token from seed and F-1 draft tokens.
     Depending on max_top_k value, may use sparse representations for efficiency.
     candidates: [B, F] sampled tokens including clean and draft.
     draft_distribution: probabilities of the draft tokens for rejection sampling.
     """
+    if rectifier is not None and draft_logits.shape[1] > 1:
+        return _sample_rectified_candidates(
+            draft_logits=draft_logits,
+            sampling_info=sampling_info,
+            max_top_k=max_top_k,
+            uniform_top_k_value=uniform_top_k_value,
+            rectifier=rectifier,
+        )
     batch_size, forward_width, vocab_size = draft_logits.shape
     flat_logits = draft_logits.reshape(-1, vocab_size)
     if max_top_k <= _SPARSE_TOP_K_LIMIT:
@@ -462,6 +472,70 @@ def sample_uno_candidates(
         candidates = _sample_from_dense_probs(probs)
         draft_distribution = UnoDraftDistribution(probs=probs[:, 1:])
     return candidates, draft_distribution
+
+
+def _sample_rectified_candidates(
+    *,
+    draft_logits: torch.Tensor,  # [B, F, V]
+    sampling_info: Any,
+    max_top_k: int,
+    uniform_top_k_value: int | None,
+    rectifier: UnoRectifier,
+) -> tuple[torch.Tensor, UnoDraftDistribution]:
+    """Sample the clean root as usual and the F-1 drafts from the rectifier."""
+    batch_size, forward_width, vocab_size = draft_logits.shape
+    clean_root_tokens = sample_uno_clean_root(
+        seed_tokens=None,
+        draft_logits=draft_logits,
+        sampling_info=sampling_info,
+        max_top_k=max_top_k,
+        uniform_top_k_value=uniform_top_k_value,
+    )
+    if sampling_info.need_top_p_sampling:
+        top_ps = sampling_info.top_ps
+    else:
+        top_ps = torch.ones(
+            (batch_size,), dtype=torch.float32, device=draft_logits.device
+        )
+    rectified = rectifier.sample(
+        draft_logits=draft_logits[:, 1:, :],
+        first_prev_tokens=clean_root_tokens,
+        temperatures=sampling_info.temperatures,
+        top_ks=sampling_info.top_ks,
+        top_ps=top_ps,
+    )
+    candidates = torch.cat(
+        (clean_root_tokens.to(torch.int64)[:, None], rectified.drafts), dim=1
+    )
+    if max_top_k <= _SPARSE_TOP_K_LIMIT:
+        return candidates, UnoDraftDistribution(
+            token_ids=rectified.candidates,
+            probs=rectified.probs,
+        )
+    # The dense chain kernel reads q over the whole vocabulary.
+    dense_probs = torch.zeros(
+        (batch_size, forward_width - 1, vocab_size),
+        dtype=torch.float32,
+        device=draft_logits.device,
+    )
+    dense_probs.scatter_(2, rectified.candidates, rectified.probs)
+    return candidates, UnoDraftDistribution(probs=dense_probs)
+
+
+def rectify_uno_greedy_candidates(
+    *,
+    candidates: torch.Tensor,  # [B, F] argmax of every draft row
+    draft_logits: torch.Tensor,  # [B, F, V]
+    rectifier: UnoRectifier,
+) -> torch.Tensor:
+    """Replace the F-1 argmax drafts with the rectified argmax chain."""
+    if candidates.shape[1] == 1:
+        return candidates
+    drafts = rectifier.greedy(
+        draft_logits=draft_logits[:, 1:, :],
+        first_prev_tokens=candidates[:, 0],
+    )
+    return torch.cat((candidates[:, :1], drafts.to(candidates.dtype)), dim=1)
 
 
 def sample_uno_clean_root(

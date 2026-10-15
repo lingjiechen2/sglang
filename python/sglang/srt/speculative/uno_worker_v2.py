@@ -32,10 +32,12 @@ from sglang.srt.speculative.uno_cuda_graph_runner import (
     UnoDecodeCudaGraphRunner,
 )
 from sglang.srt.speculative.uno_info import UnoDraftInput, UnoForwardInput
+from sglang.srt.speculative.uno_rectifier import UnoRectifier, load_uno_rectifier
 from sglang.srt.speculative.uno_tree import build_uno_tree_proposal
 from sglang.srt.speculative.uno_utils import (
     build_uno_draft_input,
     pack_uno_tree_result,
+    rectify_uno_greedy_candidates,
     run_uno_sampling,
     sample_uno_candidates,
     sample_uno_clean_root,
@@ -122,6 +124,23 @@ class UnoWorkerV2(BaseSpecWorker):
             dtype=torch.int64,
             device=self.device,
         )
+        self.rectifier = self._load_rectifier()
+
+    def _load_rectifier(self) -> Optional[UnoRectifier]:
+        if get_spec().uno_disable_rectifier:
+            return None
+        rectifier = load_uno_rectifier(
+            adapter_path=get_spec().uno_lora_path,
+            vocab_size=self.model_runner.model_config.vocab_size,
+            dtype=self.model_runner.dtype,
+            device=self.device,
+        )
+        if rectifier is not None and self.tree_mode:
+            logger.warning(
+                "UNO tree mode does not apply the draft rectifier yet; ignoring it."
+            )
+            return None
+        return rectifier
 
     def _build_uno_draft_attn_backend(self):
         """Build only the F/1 backend absent from the native Q/K target role."""
@@ -696,17 +715,25 @@ class UnoWorkerV2(BaseSpecWorker):
             draft_forward_batch,
             need_top1=all_greedy,
         )
-        if not all_greedy:
-            draft_logits = draft_result.logits_output.next_token_logits.reshape(
-                batch_size,
-                self.forward_width,
-                -1,
-            )
+        draft_logits = draft_result.logits_output.next_token_logits.reshape(
+            batch_size,
+            self.forward_width,
+            -1,
+        )
+        if all_greedy:
+            if self.rectifier is not None:
+                candidates = rectify_uno_greedy_candidates(
+                    candidates=candidates,
+                    draft_logits=draft_logits,
+                    rectifier=self.rectifier,
+                )
+        else:
             candidates, draft_distribution = sample_uno_candidates(
                 draft_logits=draft_logits,
                 sampling_info=sampling_info,
                 max_top_k=max_top_k,
                 uniform_top_k_value=uniform_top_k_value,
+                rectifier=self.rectifier,
             )
 
         verify_prefix_lens = committed_seq_lens + 1
