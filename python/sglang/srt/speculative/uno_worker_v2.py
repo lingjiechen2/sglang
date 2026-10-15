@@ -127,19 +127,23 @@ class UnoWorkerV2(BaseSpecWorker):
         self.rectifier = self._load_rectifier()
 
     def _load_rectifier(self) -> Optional[UnoRectifier]:
-        if get_spec().uno_disable_rectifier:
+        if not get_spec().uno_enable_rectifier:
             return None
+        if self.tree_mode:
+            raise NotImplementedError(
+                "--uno-enable-rectifier supports linear UNO only."
+            )
         rectifier = load_uno_rectifier(
             adapter_path=get_spec().uno_lora_path,
             vocab_size=self.model_runner.model_config.vocab_size,
             dtype=self.model_runner.dtype,
             device=self.device,
         )
-        if rectifier is not None and self.tree_mode:
-            logger.warning(
-                "UNO tree mode does not apply the draft rectifier yet; ignoring it."
+        if rectifier is None:
+            raise ValueError(
+                "--uno-enable-rectifier found no rectifier_config.json next to "
+                f"the UNO LoRA at {get_spec().uno_lora_path}."
             )
-            return None
         return rectifier
 
     def _build_uno_draft_attn_backend(self):
@@ -715,24 +719,27 @@ class UnoWorkerV2(BaseSpecWorker):
             draft_forward_batch,
             need_top1=all_greedy,
         )
-        draft_logits = draft_result.logits_output.next_token_logits.reshape(
-            batch_size,
-            self.forward_width,
-            -1,
-        )
-        if all_greedy:
-            if self.rectifier is not None:
-                candidates = rectify_uno_greedy_candidates(
-                    candidates=candidates,
-                    draft_logits=draft_logits,
-                    rectifier=self.rectifier,
-                )
-        else:
+        if not all_greedy:
+            draft_logits = draft_result.logits_output.next_token_logits.reshape(
+                batch_size,
+                self.forward_width,
+                -1,
+            )
             candidates, draft_distribution = sample_uno_candidates(
                 draft_logits=draft_logits,
                 sampling_info=sampling_info,
                 max_top_k=max_top_k,
                 uniform_top_k_value=uniform_top_k_value,
+                rectifier=self.rectifier,
+            )
+        elif self.rectifier is not None:
+            candidates = rectify_uno_greedy_candidates(
+                candidates=candidates,
+                draft_logits=draft_result.logits_output.next_token_logits.reshape(
+                    batch_size,
+                    self.forward_width,
+                    -1,
+                ),
                 rectifier=self.rectifier,
             )
 

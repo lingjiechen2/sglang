@@ -33,12 +33,12 @@ class Spec(msgspec.Struct):
         "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK, UNO. Or any name registered via `SpeculativeAlgorithm.register`.",
     ] = None
     uno_lora_path: A[Optional[str], "Path to the UNO draft LoRA checkpoint."] = None
-    uno_disable_rectifier: A[
+    uno_enable_rectifier: A[
         bool,
-        "Ignore the vanilla draft rectifier (rectifier_config.json and "
-        "rectifier_model.safetensors) shipped next to the UNO LoRA. By default it "
-        "is loaded when present and biases linear UNO drafts on the previous "
-        "draft token; verification stays lossless either way.",
+        "Load the vanilla draft rectifier (rectifier_config.json and "
+        "rectifier_model.safetensors) shipped next to the UNO LoRA and bias linear "
+        "UNO drafts on the previous draft token. Startup fails if the files are "
+        "missing. Verification stays lossless either way.",
     ] = False
     speculative_draft_model_path: A[
         Optional[str],
