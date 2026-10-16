@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -18,7 +19,7 @@ from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
 )
-from sglang.srt.runtime_context import get_schedule, get_spec
+from sglang.srt.runtime_context import get_exec, get_schedule, get_spec
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_utils import default_tree_mask_mode
@@ -27,7 +28,10 @@ from sglang.srt.speculative.eagle_worker_common import (
     run_eagle_verify,
 )
 from sglang.srt.speculative.spec_info import SpecInputType, SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import get_plan_stream
+from sglang.srt.speculative.spec_utils import (
+    commit_mamba_states_after_verify,
+    get_plan_stream,
+)
 from sglang.srt.speculative.uno_cuda_graph_runner import (
     UnoDecodeCudaGraphRunner,
 )
@@ -125,6 +129,8 @@ class UnoWorkerV2(BaseSpecWorker):
             device=self.device,
         )
         self.rectifier = self._load_rectifier()
+        # Set once the target pools exist (init_attention_backends).
+        self._commits_mamba_state = False
 
     def _load_rectifier(self) -> Optional[UnoRectifier]:
         if not get_spec().uno_enable_rectifier:
@@ -166,7 +172,35 @@ class UnoWorkerV2(BaseSpecWorker):
 
         if self.tree_mode:
             self._uno_draft_attn_backend = self._build_uno_draft_attn_backend()
+        # Linear-attention layers keep a recurrent state that TARGET_VERIFY
+        # never advances; UNO commits it after each of its two passes.
+        self._commits_mamba_state = (
+            mambaish_config(self.model_runner.model_config) is not None
+        )
+        if self._commits_mamba_state and self.tree_mode:
+            raise NotImplementedError(
+                "UNO tree mode does not support linear-attention (e.g. GDN) models."
+            )
+        if self._commits_mamba_state and get_exec().mamba.enable_mamba_extra_buffer:
+            raise NotImplementedError(
+                "UNO on linear-attention models does not track prefix-cache "
+                "states yet; pass --disable-radix-cache."
+            )
 
+    def _commit_mamba_state(
+        self, *, batch: ScheduleBatch, num_commit_rows: torch.Tensor
+    ) -> None:
+        """Advance each request's linear-attention state past the first
+        ``num_commit_rows`` rows of the forward that just ran."""
+        commit_mamba_states_after_verify(
+            target_worker=self.target_worker,
+            batch=batch,
+            accept_lens=num_commit_rows,
+            # Only checked for emptiness once the step indices are supplied.
+            accept_index=num_commit_rows,
+            draft_token_num=self.forward_width,
+            prepared_step_indices=(num_commit_rows - 1, None),
+        )
     def init_cuda_graphs(self):
         """Capture only the private F-wide tree-draft graph."""
 
@@ -719,6 +753,14 @@ class UnoWorkerV2(BaseSpecWorker):
             draft_forward_batch,
             need_top1=all_greedy,
         )
+        if self._commits_mamba_state:
+            # Only the seed row of the draft pass is a real token.
+            self._commit_mamba_state(
+                batch=batch,
+                num_commit_rows=torch.ones(
+                    batch_size, dtype=torch.int64, device=self.device
+                ),
+            )
         if not all_greedy:
             draft_logits = draft_result.logits_output.next_token_logits.reshape(
                 batch_size,
@@ -779,6 +821,12 @@ class UnoWorkerV2(BaseSpecWorker):
             accept_lens = sampling_result.accept_lens
             new_seq_lens = sampling_result.new_seq_lens
             correction = sampling_result.next_seed_tokens
+
+        if self._commits_mamba_state:
+            # Verify row 0 is the clean root; rows 1..k are the accepted drafts.
+            self._commit_mamba_state(
+                batch=batch, num_commit_rows=accept_lens.to(torch.int64) - 1
+            )
 
         next_draft_input = UnoDraftInput(
             bonus_tokens=correction,

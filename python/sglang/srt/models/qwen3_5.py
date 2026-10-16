@@ -134,6 +134,7 @@ from sglang.srt.runtime_context import (
     get_lora,
     get_model,
     get_parallel,
+    get_spec,
     get_stream,
     linear_attn_parallel_group,
 )
@@ -704,9 +705,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             and self.config.model_type not in _QWEN3_5_ROCM_PACKED_MODEL_TYPES
         ):
             return
-        if get_lora().enable_lora or get_lora().lora_paths:
-            # LoRA wraps the individual Linear modules; the fused GEMM would
-            # bypass their adapters.
+        if (
+            get_lora().enable_lora
+            or get_lora().lora_paths
+            or get_spec().uno_lora_path is not None
+        ):
+            # LoRA (including UNO's internal draft adapter) wraps the individual
+            # Linear modules; the fused GEMM would bypass their adapters.
             return
         if _use_aiter and not get_bool_env_var("SGLANG_QWEN35_PACKED_IN_PROJ", "True"):
             return

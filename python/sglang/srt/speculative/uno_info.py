@@ -252,6 +252,8 @@ class UnoForwardInput(SpecInput):
     custom_mask: Optional[torch.Tensor] = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
     hidden_states: Optional[torch.Tensor] = None
+    # Linear-attention backends read this in TARGET_VERIFY; UNO rows are dense.
+    ragged_verify_layout: ClassVar[None] = None
 
     # derived
     num_tokens_per_req: int = field(init=False)
