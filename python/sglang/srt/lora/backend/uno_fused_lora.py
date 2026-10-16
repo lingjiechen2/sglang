@@ -178,6 +178,8 @@ class UnoFusedLoRA(msgspec.Struct, frozen=True):
         inter = self.out_features // 2
         out = torch.empty((rows, inter), dtype=full.dtype, device=full.device)
         block_m, block_n = (16, 32) if rows <= 16 else (64, 64)
+        # Measured on H200 (inter 17408, rank 128): two stages up to 64 rows.
+        stages = {"num_stages": 2} if rows <= 64 else {}
         grid = (triton.cdiv(rows, block_m), triton.cdiv(inter, block_n))
         _uno_lora_expand_silu_mul_kernel[grid](
             full,
@@ -195,6 +197,7 @@ class UnoFusedLoRA(msgspec.Struct, frozen=True):
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             num_warps=4,
+            **stages,
             **_PDL_KWARGS,
         )
         return out
@@ -206,6 +209,8 @@ class UnoFusedLoRA(msgspec.Struct, frozen=True):
         # Measured on H200 with Qwen3.8-27B layer shapes (rank 128).
         if rows <= 16:
             block_m, block_n, num_warps, num_stages = 16, 32, 4, 2
+        elif rows <= 64:
+            block_m, block_n, num_warps, num_stages = 64, 64, 4, 1
         else:
             block_m, block_n, num_warps, num_stages = 64, 128, 4, 1
         grid = (triton.cdiv(rows, block_m), triton.cdiv(self.out_features, block_n))
