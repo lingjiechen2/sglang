@@ -1226,7 +1226,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     query_start_loc=query_start_loc,
                     intermediate_states_buffer=intermediate_state_cache,
                     intermediate_state_indices=intermediate_state_indices,
-                    cache_steps=forward_batch.spec_info.draft_token_num,
+                    # The allocated step dim: a UNO tree draft pass runs F rows
+                    # against buffers sized for the Q-node verify.
+                    cache_steps=intermediate_state_cache.shape[1],
                     retrieve_parent_token=retrieve_parent_token,
                     stable_rows=pp_spec_stable_rows_enabled(),
                 )

@@ -173,9 +173,16 @@ class UnoWorkerV2(BaseSpecWorker):
         self._commits_mamba_state = (
             mambaish_config(self.model_runner.model_config) is not None
         )
-        if self._commits_mamba_state and self.tree_mode:
+        if (
+            self._commits_mamba_state
+            and self.tree_mode
+            and get_exec().mamba.enable_linear_replayssm_spec
+        ):
+            # Tree verify keeps one recurrent state per node; ReplaySSM's ring
+            # only represents a linear chain.
             raise NotImplementedError(
-                "UNO tree mode does not support linear-attention (e.g. GDN) models."
+                "UNO tree mode on linear-attention models needs the recurrent "
+                "verify; drop --enable-linear-replayssm-spec."
             )
         if self._commits_mamba_state and get_exec().mamba.enable_mamba_extra_buffer:
             raise NotImplementedError(
@@ -562,6 +569,17 @@ class UnoWorkerV2(BaseSpecWorker):
             self.forward_width,
             -1,
         )
+        if self._commits_mamba_state:
+            # The seed row is the only real token of the draft pass; commit it
+            # through the draft backend that holds this pass's state indices.
+            # EAGLE's tree verify then commits the accepted path itself.
+            with self._bind_uno_draft_runtime():
+                self._commit_mamba_state(
+                    batch=batch,
+                    num_commit_rows=torch.ones(
+                        batch_size, dtype=torch.int64, device=self.device
+                    ),
+                )
 
         sampling_info = batch.sampling_info
         if sampling_info.is_all_greedy:
