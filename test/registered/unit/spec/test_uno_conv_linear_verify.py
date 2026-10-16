@@ -29,11 +29,16 @@ def _dedup_window(slots, num_tokens, dim, width):
 
 
 class TestUnoConvLinearVerify(CustomTestCase):
-    def _check(self, batch, dim, num_tokens, width, with_bias, padded_request):
+    def _check(
+        self, batch, dim, num_tokens, width, with_bias, padded_request, row_pad=0
+    ):
         torch.manual_seed(batch + dim)
         slots = batch + 3
+        # row_pad > 0: x is a column slice of a wider projection output.
         x = (
-            torch.randn(batch * num_tokens, dim, device=_DEVICE, dtype=torch.bfloat16)
+            torch.randn(
+                batch * num_tokens, dim + row_pad, device=_DEVICE, dtype=torch.bfloat16
+            )[:, :dim]
             .view(batch, num_tokens, dim)
             .transpose(1, 2)
         )
@@ -52,7 +57,7 @@ class TestUnoConvLinearVerify(CustomTestCase):
         ref_state, new_state = conv_state.clone(), conv_state.clone()
 
         ref = causal_conv1d_update(
-            x, ref_state, weight, bias, "silu",
+            x.transpose(1, 2).contiguous().transpose(1, 2), ref_state, weight, bias, "silu",
             conv_state_indices=state_idx,
             intermediate_conv_window=ref_window,
             intermediate_state_indices=window_idx,
@@ -64,6 +69,7 @@ class TestUnoConvLinearVerify(CustomTestCase):
             intermediate_conv_window=new_window,
             intermediate_state_indices=window_idx,
         )
+        self.assertEqual(new.transpose(1, 2).reshape(-1, dim).data_ptr(), new.data_ptr())
         live = slice(0, batch - 1) if padded_request else slice(0, batch)
         torch.testing.assert_close(new[live].float(), ref[live].float(), rtol=2e-2, atol=2e-2)
         torch.testing.assert_close(new_phys, ref_phys, rtol=0, atol=0)
@@ -74,6 +80,12 @@ class TestUnoConvLinearVerify(CustomTestCase):
 
     def test_single_request_with_bias(self):
         self._check(batch=1, dim=320, num_tokens=8, width=4, with_bias=True, padded_request=False)
+
+    def test_strided_projection_view(self):
+        self._check(
+            batch=4, dim=320, num_tokens=8, width=4, with_bias=False,
+            padded_request=False, row_pad=96,
+        )
 
     def test_padded_request_is_skipped(self):
         self._check(batch=4, dim=192, num_tokens=5, width=4, with_bias=False, padded_request=True)

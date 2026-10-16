@@ -1077,15 +1077,23 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
-            mixed_qkv_reshaped = mixed_qkv.view(
-                batch_size, draft_token_num, -1
-            ).transpose(1, 2)
-            if _uses_linear_verify_conv(
+            linear_verify_conv = _uses_linear_verify_conv(
                 forward_batch.spec_info,
                 intermediate_conv_window_cache,
                 layer.conv_weights.shape[-1],
                 retrieve_next_token,
-            ):
+            )
+            # UNO's fused LoRA projection hands over strided views of the
+            # projection output; only the linear-verify conv and the ReplaySSM
+            # verify kernel read them in place, other consumers get copies.
+            if not linear_verify_conv and not mixed_qkv.is_contiguous():
+                mixed_qkv = mixed_qkv.contiguous()
+            if not (use_replayssm_spec and not use_replayssm_fold):
+                a, b = a.contiguous(), b.contiguous()
+            mixed_qkv_reshaped = mixed_qkv.view(
+                batch_size, draft_token_num, -1
+            ).transpose(1, 2)
+            if linear_verify_conv:
                 mixed_qkv_processed = causal_conv1d_linear_verify(
                     mixed_qkv_reshaped,
                     conv_states,

@@ -1052,8 +1052,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             else:
                 num_k_heads_tp = triton.cdiv(self.num_k_heads, self.attn_tp_size)
                 num_v_heads_tp = triton.cdiv(self.num_v_heads, self.attn_tp_size)
-            use_strided_prefill_z = (
-                _is_cuda and forward_batch.forward_mode.is_extend_without_speculative()
+            # UNO's fused LoRA projection (opt-in) also skips the unpack copy
+            # in verify: the GDN verify path reads the strided views in place.
+            use_strided_prefill_z = _is_cuda and (
+                forward_batch.forward_mode.is_extend_without_speculative()
+                or (
+                    self.uno_fused_in_proj is not None
+                    and forward_batch.forward_mode.is_target_verify()
+                )
             )
             split_fn = (
                 qwen3_5_gdn_prefill_projection_views
