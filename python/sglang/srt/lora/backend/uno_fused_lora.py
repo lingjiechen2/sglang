@@ -80,6 +80,60 @@ def _uno_lora_expand_kernel(
     tl.store(out + rows64[:, None] * N + cols[None, :], result.to(base.dtype), mask=mask)
 
 
+@triton.jit
+def _uno_lora_expand_silu_mul_kernel(
+    full,  # [M, 2I + U * R]: gate | up base outputs, then LoRA-A blocks
+    full_row_stride,
+    lora_b,  # [2I, >= R]: gate rows then up rows
+    lora_b_row_stride,
+    out,  # [M, I] contiguous
+    M,
+    inter,
+    forward_width,
+    scaling,
+    GATE_BLOCK: tl.constexpr,
+    UP_BLOCK: tl.constexpr,
+    R: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """silu(gate) * up of a folded gate_up layer, LoRA added on draft rows."""
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    row_mask = rows < M
+    col_mask = cols < inter
+    rows64 = rows.to(tl.int64)
+    cols64 = cols.to(tl.int64)
+    lora_rows = row_mask & (rows % forward_width != 0)
+    ranks = tl.arange(0, R)
+    a_base = full + rows64[:, None] * full_row_stride + 2 * inter + ranks[None, :]
+    h_gate = tl.load(a_base + GATE_BLOCK * R, mask=lora_rows[:, None], other=0.0)
+    h_up = tl.load(a_base + UP_BLOCK * R, mask=lora_rows[:, None], other=0.0)
+    b_gate = tl.load(
+        lora_b + cols64[:, None] * lora_b_row_stride + ranks[None, :],
+        mask=col_mask[:, None],
+        other=0.0,
+    )
+    b_up = tl.load(
+        lora_b + (cols64 + inter)[:, None] * lora_b_row_stride + ranks[None, :],
+        mask=col_mask[:, None],
+        other=0.0,
+    )
+    mask = row_mask[:, None] & col_mask[None, :]
+    base_ptr = full + rows64[:, None] * full_row_stride + cols64[None, :]
+    gate = tl.load(base_ptr, mask=mask, other=0.0)
+    up = tl.load(base_ptr + inter, mask=mask, other=0.0)
+    # Round to the layer's dtype first, as the unfused gate_up output would be.
+    gate = (gate.to(tl.float32) + scaling * tl.dot(h_gate, tl.trans(b_gate))).to(gate.dtype)
+    up = (up.to(tl.float32) + scaling * tl.dot(h_up, tl.trans(b_up))).to(up.dtype)
+    g = gate.to(tl.float32)
+    # Same formula as sglang's act_and_mul SiLU.
+    act = g / (1.0 + tl.exp(-g)) * up.to(tl.float32)
+    tl.store(out + rows64[:, None] * inter + cols64[None, :], act.to(gate.dtype), mask=mask)
+
+
 class UnoFusedLoRA(msgspec.Struct, frozen=True):
     """One LoRA-wrapped linear layer folded for UNO draft forwards."""
 
@@ -96,10 +150,39 @@ class UnoFusedLoRA(msgspec.Struct, frozen=True):
     scaling: float
     # Output width of each folded layer, in order.
     out_splits: tuple[int, ...] = ()
+    # LoRA-A block of the gate and up slices, for a folded gate_up layer.
+    gate_up_blocks: tuple[int, ...] = ()
 
     def base_forward(self, x: torch.Tensor) -> torch.Tensor:
         """The folded layers' base outputs only (no LoRA), as one GEMM."""
         return torch.mm(x, self.weight_cat[: self.out_features].t())
+
+    def forward_silu_mul(self, x: torch.Tensor, *, forward_width: int) -> torch.Tensor:
+        """silu(gate) * up of a folded two-slice gate_up layer, in one pass."""
+        full = torch.mm(x, self.weight_cat.t())
+        rows = full.shape[0]
+        inter = self.out_features // 2
+        out = torch.empty((rows, inter), dtype=full.dtype, device=full.device)
+        block_m, block_n = (16, 32) if rows <= 16 else (64, 64)
+        grid = (triton.cdiv(rows, block_m), triton.cdiv(inter, block_n))
+        _uno_lora_expand_silu_mul_kernel[grid](
+            full,
+            full.stride(0),
+            self.lora_b,
+            self.lora_b.stride(0),
+            out,
+            rows,
+            inter,
+            forward_width,
+            self.scaling,
+            GATE_BLOCK=self.gate_up_blocks[0],
+            UP_BLOCK=self.gate_up_blocks[1],
+            R=self.rank,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            num_warps=4,
+        )
+        return out
 
     def forward(self, x: torch.Tensor, *, forward_width: int) -> torch.Tensor:
         full = torch.mm(x, self.weight_cat.t())
@@ -245,6 +328,7 @@ def fold_uno_lora_group(
         rank=rank,
         scaling=scaling,
         out_splits=tuple(part[0].shape[0] for part in parts),
+        gate_up_blocks=tuple(slice_blocks) if len(slice_blocks) == 2 else (),
     )
 
 

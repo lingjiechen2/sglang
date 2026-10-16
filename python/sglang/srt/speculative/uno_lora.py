@@ -73,6 +73,8 @@ def _fold_uno_lora(manager: LoRAManager, lora_id: str) -> None:
         fold_uno_lora_group,
         fold_uno_lora_layer,
     )
+    from sglang.srt.lora.layers import BaseLayerWithLoRA
+    from sglang.srt.models.qwen2_moe import Qwen2MoeMLP
     from sglang.srt.models.qwen3_5 import Qwen3_5GatedDeltaNet
 
     adapter = manager.loras[lora_id]
@@ -106,12 +108,25 @@ def _fold_uno_lora(manager: LoRAManager, lora_id: str) -> None:
                 continue
             module.uno_fused = fused
             num_folded += 1
+    # Dense MLPs fuse the folded gate_up expand with SiLU*mul on draft rows.
+    num_mlps = 0
+    for module in manager.base_model.modules():
+        if not isinstance(module, Qwen2MoeMLP) or not isinstance(
+            module.gate_up_proj, BaseLayerWithLoRA
+        ):
+            continue
+        fused = module.gate_up_proj.uno_fused
+        if fused is None or len(fused.gate_up_blocks) != 2 or fused.out_features % 2:
+            continue
+        module.uno_fused_gate_up = fused
+        num_mlps += 1
     logger.info(
         "UNO fused LoRA: %d GDN input groups, %d single layers folded, "
-        "%d keep the unfused path.",
+        "%d keep the unfused path, %d MLPs fuse SiLU*mul.",
         num_groups,
         num_folded,
         num_kept,
+        num_mlps,
     )
 
 

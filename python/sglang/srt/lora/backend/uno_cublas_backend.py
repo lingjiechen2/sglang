@@ -450,6 +450,10 @@ class UnoCublasLoRABackend(TritonLoRABackend):
         """One folded base+LoRA-A GEMM and the LoRA-B expand (``--uno-fused-lora``)."""
         return fused.forward(x, forward_width=self._route().forward_width)
 
+    def run_uno_fused_lora_silu_mul(self, fused, x: torch.Tensor) -> torch.Tensor:
+        """Folded gate_up GEMM plus LoRA-B expand fused with SiLU*mul."""
+        return fused.forward_silu_mul(x, forward_width=self._route().forward_width)
+
     def _consume_lora_a_overlap(
         self,
         pending: _PendingLoRAA,

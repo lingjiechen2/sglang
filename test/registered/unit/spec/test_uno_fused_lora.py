@@ -128,6 +128,21 @@ class TestUnoFusedLoRA(CustomTestCase):
         for module, weight in zip((qkvz, ba), weights):
             torch.testing.assert_close(module.base_layer.weight.data, weight, rtol=0, atol=0)
 
+    def test_gate_up_silu_mul_matches_expand_then_activation(self):
+        """The fused SiLU*mul equals expanding gate|up, rounding, then SiLU*mul."""
+        torch.manual_seed(2)
+        inter = 160
+        module = _module([inter, inter], set())
+        fused = fold_uno_lora_layer(module, weight_index=1, rank=_RANK, scaling=_SCALING)
+        self.assertEqual(len(fused.gate_up_blocks), 2)
+        x = torch.randn(3 * 8, 96, device=_DEVICE).to(torch.bfloat16)
+        gate_up = fused.forward(x, forward_width=8).float()
+        gate, up = gate_up[:, :inter], gate_up[:, inter:]
+        expected = gate / (1.0 + torch.exp(-gate)) * up
+        torch.testing.assert_close(
+            fused.forward_silu_mul(x, forward_width=8).float(), expected, rtol=2e-2, atol=5e-2
+        )
+
     def test_single_slice_many_requests(self):
         self._check([200], set(), num_requests=20, forward_width=4)
 

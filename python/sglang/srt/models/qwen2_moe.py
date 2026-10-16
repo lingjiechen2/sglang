@@ -203,6 +203,9 @@ class Qwen2MoeMLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        # Set only by UNO's --uno-fused-lora: draft rows fuse the gate_up LoRA
+        # expand with SiLU*mul (see lora/backend/uno_fused_lora.py).
+        self.uno_fused_gate_up = None
         # Set externally (see qwen3_5.py) when both projections are NVFP4 and
         # the FlashInfer fused SiLU+mul+FP4-quant kernel is available. The
         # fused path replaces act_fn + the down_proj input quantization with a
@@ -243,6 +246,12 @@ class Qwen2MoeMLP(nn.Module):
         self,
         x,
     ):
+        if self.uno_fused_gate_up is not None and self.gate_up_proj.lora_active:
+            x = self.gate_up_proj.lora_backend.run_uno_fused_lora_silu_mul(
+                self.uno_fused_gate_up, x
+            )
+            x, _ = self.down_proj(x)
+            return x
         gate_up, _ = self.gate_up_proj(x)
         if self._enable_silu_fp4_quant_fusion and not isinstance(gate_up, tuple):
             x, _ = self.down_proj(self._silu_fp4_quant_fused(gate_up))
