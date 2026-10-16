@@ -36,8 +36,9 @@ class Spec(msgspec.Struct):
     uno_enable_rectifier: A[
         bool,
         "Load the vanilla draft rectifier (rectifier_config.json and "
-        "rectifier_model.safetensors) shipped next to the UNO LoRA and bias linear "
-        "UNO drafts on the previous draft token. Startup fails if the files are "
+        "rectifier_model.safetensors) shipped next to the UNO LoRA and bias UNO "
+        "drafts (linear chains and tree children) on the previous draft token. "
+        "Startup fails if the files are "
         "missing. Verification stays lossless either way.",
     ] = False
     uno_fused_lora: A[

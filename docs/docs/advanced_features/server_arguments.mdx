@@ -1596,7 +1596,7 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--uno-enable-rectifier`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>UNO only. Load the vanilla draft rectifier shipped next to the UNO LoRA and bias linear UNO drafts on the previous draft token. Startup fails if the rectifier files are missing. Verification stays lossless either way.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>UNO only. Load the vanilla draft rectifier shipped next to the UNO LoRA and bias UNO drafts (linear chains and tree children) on the previous draft token. Startup fails if the rectifier files are missing. Verification stays lossless either way.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>

@@ -135,10 +135,6 @@ class UnoWorkerV2(BaseSpecWorker):
     def _load_rectifier(self) -> Optional[UnoRectifier]:
         if not get_spec().uno_enable_rectifier:
             return None
-        if self.tree_mode:
-            raise NotImplementedError(
-                "--uno-enable-rectifier supports linear UNO only."
-            )
         rectifier = load_uno_rectifier(
             adapter_path=get_spec().uno_lora_path,
             vocab_size=self.model_runner.model_config.vocab_size,
@@ -582,6 +578,15 @@ class UnoWorkerV2(BaseSpecWorker):
                 uniform_top_k_value=draft_state.uniform_top_k_value,
             )
 
+        rectified_children = None
+        if self.rectifier is not None and self.forward_width > 1:
+            # Each tree node's children are rectified on the node's own token.
+            rectified_children = self.rectifier.tree_children(
+                draft_logits=draft_logits[:, 1:, :],
+                root_tokens=clean_root_tokens,
+                temperatures=sampling_info.temperatures,
+                top_k=self.candidate_top_k,
+            )
         proposal = build_uno_tree_proposal(
             clean_root_tokens,
             draft_logits[:, 1:, :],
@@ -589,6 +594,7 @@ class UnoWorkerV2(BaseSpecWorker):
             candidate_top_k=self.candidate_top_k,
             temperature=sampling_info.temperatures,
             workspace=self._uno_tree_workspace,
+            rectified_children=rectified_children,
         )
 
         # The first pass wrote the carried seed at C.  Give EAGLE a shallow

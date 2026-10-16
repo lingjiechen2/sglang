@@ -19,6 +19,8 @@ import triton.language as tl
 from flashinfer import top_k as _flashinfer_top_k
 from torch import Tensor
 
+from sglang.srt.speculative.uno_rectifier import UnoRectifiedTreeChildren
+
 
 @dataclass(frozen=True)
 class UnoTreeProposal:
@@ -259,6 +261,8 @@ def _build_tree_kernel(
     parent_list,
     search_depths,
     search_log_masses,
+    child_slots,
+    search_slots,
     TOKEN_BATCH_STRIDE: tl.constexpr,
     TOKEN_DEPTH_STRIDE: tl.constexpr,
     TOKEN_RANK_STRIDE: tl.constexpr,
@@ -270,7 +274,13 @@ def _build_tree_kernel(
     K: tl.constexpr,
     Q: tl.constexpr,
     BLOCK_CANDIDATES: tl.constexpr,
+    TOKEN_SLOT_STRIDE: tl.constexpr = 0,
+    PROB_SLOT_STRIDE: tl.constexpr = 0,
+    HAS_SLOTS: tl.constexpr = False,
 ):
+    # HAS_SLOTS: candidates are per parent ([B, depth, slot, K], e.g. the
+    # rectified lattice) and each node remembers the slot its children are
+    # read from; child_slots shares the token layout.
     batch = tl.program_id(0)
     search_offset = batch * Q
     edge_output_offset = batch * (Q - 1)
@@ -290,6 +300,8 @@ def _build_tree_kernel(
     )
     tl.store(search_depths + search_offset, 0)
     tl.store(search_log_masses + search_offset, 0.0)
+    if HAS_SLOTS:
+        tl.store(search_slots + search_offset, 0)
     tl.debug_barrier()
 
     for node_index in range(1, Q):
@@ -307,19 +319,25 @@ def _build_tree_kernel(
         ).to(tl.float32)
         valid = parent_valid & (parent_depth < NUM_DEPTHS) & ~used
         safe_depth = tl.where(valid, parent_depth, 0)
-        token = tl.load(
-            top_token_ids
-            + batch * TOKEN_BATCH_STRIDE
+        token_offset = (
+            batch * TOKEN_BATCH_STRIDE
             + safe_depth * TOKEN_DEPTH_STRIDE
-            + candidate_ranks * TOKEN_RANK_STRIDE,
-            mask=valid,
-            other=0,
+            + candidate_ranks * TOKEN_RANK_STRIDE
         )
-        log_prob = tl.load(
-            top_log_probs
-            + batch * PROB_BATCH_STRIDE
+        prob_offset = (
+            batch * PROB_BATCH_STRIDE
             + safe_depth * PROB_DEPTH_STRIDE
-            + candidate_ranks * PROB_RANK_STRIDE,
+            + candidate_ranks * PROB_RANK_STRIDE
+        )
+        if HAS_SLOTS:
+            parent_slot = tl.load(
+                search_slots + search_offset + safe_parent, mask=valid, other=0
+            ).to(tl.int64)
+            token_offset += parent_slot * TOKEN_SLOT_STRIDE
+            prob_offset += parent_slot * PROB_SLOT_STRIDE
+        token = tl.load(top_token_ids + token_offset, mask=valid, other=0)
+        log_prob = tl.load(
+            top_log_probs + prob_offset,
             mask=valid,
             other=-float("inf"),
         ).to(tl.float32)
@@ -343,20 +361,26 @@ def _build_tree_kernel(
         selected_parent = best_slot // K
         selected_rank = best_slot % K
         selected_depth = tl.load(search_depths + search_offset + selected_parent)
-        selected_mass = tl.load(search_log_masses + search_offset + selected_parent).to(
-            tl.float32
-        ) + tl.load(
-            top_log_probs
-            + batch * PROB_BATCH_STRIDE
-            + selected_depth * PROB_DEPTH_STRIDE
-            + selected_rank * PROB_RANK_STRIDE
-        ).to(tl.float32)
-        selected_token = tl.load(
-            top_token_ids
-            + batch * TOKEN_BATCH_STRIDE
+        selected_token_offset = (
+            batch * TOKEN_BATCH_STRIDE
             + selected_depth * TOKEN_DEPTH_STRIDE
             + selected_rank * TOKEN_RANK_STRIDE
         )
+        selected_prob_offset = (
+            batch * PROB_BATCH_STRIDE
+            + selected_depth * PROB_DEPTH_STRIDE
+            + selected_rank * PROB_RANK_STRIDE
+        )
+        if HAS_SLOTS:
+            selected_parent_slot = tl.load(
+                search_slots + search_offset + selected_parent
+            ).to(tl.int64)
+            selected_token_offset += selected_parent_slot * TOKEN_SLOT_STRIDE
+            selected_prob_offset += selected_parent_slot * PROB_SLOT_STRIDE
+        selected_mass = tl.load(search_log_masses + search_offset + selected_parent).to(
+            tl.float32
+        ) + tl.load(top_log_probs + selected_prob_offset).to(tl.float32)
+        selected_token = tl.load(top_token_ids + selected_token_offset)
 
         output_index = edge_output_offset + node_index - 1
         tl.store(draft_tokens + output_index, selected_token)
@@ -377,6 +401,11 @@ def _build_tree_kernel(
             search_log_masses + search_offset + node_index,
             selected_mass,
         )
+        if HAS_SLOTS:
+            tl.store(
+                search_slots + search_offset + node_index,
+                tl.load(child_slots + selected_token_offset),
+            )
         used |= candidate_slots == best_slot
         tl.debug_barrier()
 
@@ -405,6 +434,7 @@ def build_uno_tree_proposal(
     candidate_top_k: int,
     temperature: float | Tensor,
     workspace: dict[str, Tensor] | None = None,
+    rectified_children: UnoRectifiedTreeChildren | None = None,
 ) -> UnoTreeProposal:
     """Build fixed-``Q`` UNO trees directly in EAGLE's proposal ABI.
 
@@ -412,6 +442,10 @@ def build_uno_tree_proposal(
     Candidate log probabilities are normalized over the full vocabulary.  No
     CPU reference/fallback, direct parent array, attention mask, traversal
     structure, acceptance walk, or KV operation is implemented here.
+
+    With ``rectified_children`` every node takes its children from its own
+    lattice row (``UnoRectifier.tree_children``) instead of the depth's shared
+    top-k; the edge encoding ``parent_node * K + rank`` is unchanged.
     """
 
     if root_tokens.ndim != 1:
@@ -525,6 +559,61 @@ def build_uno_tree_proposal(
             max_depth=num_depths,
         )
 
+    search_shape = (batch_size, max_nodes)
+    search_depths = buffer("search_depths", search_shape, torch.int32)
+    search_log_masses = buffer("search_log_masses", search_shape, torch.float32)
+    if rectified_children is not None:
+        tokens = rectified_children.tokens
+        log_probs = rectified_children.log_probs
+        slots = rectified_children.slots
+        expected = (batch_size, num_depths, tokens.size(2), candidate_top_k)
+        if (
+            tokens.shape != expected
+            or log_probs.shape != expected
+            or slots.shape != expected
+            or slots.stride() != tokens.stride()
+        ):
+            raise ValueError(
+                f"rectified tree children must be {expected} with matching token "
+                f"and slot layouts; got {tuple(tokens.shape)}, "
+                f"{tuple(log_probs.shape)}, {tuple(slots.shape)}"
+            )
+        _build_tree_kernel[(batch_size,)](
+            tokens,
+            log_probs,
+            draft_tokens,
+            selected_edges,
+            parent_list,
+            search_depths,
+            search_log_masses,
+            slots,
+            buffer("search_slots", search_shape, torch.int64),
+            TOKEN_BATCH_STRIDE=tokens.stride(0),
+            TOKEN_DEPTH_STRIDE=tokens.stride(1),
+            TOKEN_RANK_STRIDE=tokens.stride(3),
+            PROB_BATCH_STRIDE=log_probs.stride(0),
+            PROB_DEPTH_STRIDE=log_probs.stride(1),
+            PROB_RANK_STRIDE=log_probs.stride(3),
+            PARENT_BATCH_STRIDE=parent_list.stride(0),
+            NUM_DEPTHS=num_depths,
+            K=candidate_top_k,
+            Q=max_nodes,
+            BLOCK_CANDIDATES=triton.next_power_of_2(max_nodes * candidate_top_k),
+            TOKEN_SLOT_STRIDE=tokens.stride(2),
+            PROB_SLOT_STRIDE=log_probs.stride(2),
+            HAS_SLOTS=True,
+            num_warps=8,
+            num_stages=1,
+        )
+        return UnoTreeProposal(
+            root_tokens=root_tokens,
+            draft_tokens=draft_tokens,
+            parent_list=parent_list,
+            top_scores_index=selected_edges,
+            candidate_top_k=candidate_top_k,
+            max_depth=num_depths,
+        )
+
     candidate_shape = (batch_size, num_depths, candidate_top_k)
     flat_logits = draft_logits.contiguous().view(batch_size * num_depths, vocab_size)
     flat_top_values, flat_top_token_ids = _flashinfer_top_k(
@@ -548,9 +637,6 @@ def build_uno_tree_proposal(
         temperature,
     )
 
-    search_shape = (batch_size, max_nodes)
-    search_depths = buffer("search_depths", search_shape, torch.int32)
-    search_log_masses = buffer("search_log_masses", search_shape, torch.float32)
     _build_tree_kernel[(batch_size,)](
         top_token_ids,
         top_log_probs,
@@ -559,6 +645,8 @@ def build_uno_tree_proposal(
         parent_list,
         search_depths,
         search_log_masses,
+        search_depths,  # child/search slots: unused without HAS_SLOTS
+        search_depths,
         TOKEN_BATCH_STRIDE=top_token_ids.stride(0),
         TOKEN_DEPTH_STRIDE=top_token_ids.stride(1),
         TOKEN_RANK_STRIDE=top_token_ids.stride(2),

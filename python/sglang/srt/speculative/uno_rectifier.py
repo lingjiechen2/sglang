@@ -1,4 +1,4 @@
-"""Vanilla Markov rectifier for UNO linear draft rows.
+"""Vanilla Markov rectifier for UNO draft rows (linear chains and trees).
 
 The rectifier adds a previous-token bias ``W2 @ W1[prev]`` to every UNO draft
 row (the DSpark vanilla Markov head), where ``prev`` is the token sampled for
@@ -6,7 +6,10 @@ the row before it and the clean root conditions the first draft row.  Drafts
 are sampled from a lattice of each row's top-K base candidates, so the
 transition biases of one step are a single batched GEMM and the full
 vocabulary is never biased; the exact q of every row is returned for p/q
-verification, which keeps the verifier lossless.
+verification, which keeps the verifier lossless.  For tree mode the same
+lattice gives every tree node its own rectified children; tree verification
+samples from the target alone, so the proposal changes only which tokens are
+tried.
 """
 
 from __future__ import annotations
@@ -103,6 +106,64 @@ def _rectified_chain_kernel(
                 tl.where(probs > 0.0, tl.log(probs) + gumbel, float("-inf")), axis=0
             )
         tl.store(drafts + batch * S + step, tl.load(candidates + row + previous))
+
+
+@triton.jit
+def _tree_children_kernel(
+    candidate_logits,  # [B, S, K] base draft logits of each row's candidates
+    candidates,  # [B, S, K] int64
+    biases,  # [B, S, K, K] bias of candidate k given previous candidate p
+    temperatures,  # [B] fp32
+    child_tokens,  # [B, S, K, TOP] int64 output
+    child_log_probs,  # [B, S, K, TOP] fp32 output
+    child_slots,  # [B, S, K, TOP] int64 output
+    S,
+    K: tl.constexpr,
+    TOP: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Rectified children of one tree parent: lattice candidate p of row j - 1.
+
+    The row is log-normalized over the lattice and its TOP best candidates are
+    returned best first, ties toward the lower lattice slot.
+    """
+    row = tl.program_id(0).to(tl.int64)  # (b, j, p)
+    batch_row = row // K  # (b, j)
+    batch = batch_row // S
+    offsets = tl.arange(0, BLOCK_K)
+    in_bounds = offsets < K
+    temperature = tl.load(temperatures + batch).to(tl.float32)
+    inverse_temperature = tl.where(temperature > 0.0, 1.0 / temperature, 1.0)
+    scores = tl.load(
+        candidate_logits + batch_row * K + offsets, mask=in_bounds, other=0.0
+    ).to(tl.float32)
+    scores += tl.load(biases + row * K + offsets, mask=in_bounds, other=0.0).to(
+        tl.float32
+    )
+    scores = tl.where(in_bounds, scores * inverse_temperature, float("-inf"))
+    peak = tl.max(scores, axis=0)
+    normalizer = peak + tl.log(tl.sum(tl.exp(scores - peak), axis=0))
+    for rank in tl.static_range(TOP):
+        best = tl.max(scores, axis=0)
+        slot = tl.argmax(scores, axis=0)
+        out = row * TOP + rank
+        tl.store(child_log_probs + out, tl.minimum(best - normalizer, 0.0))
+        tl.store(child_slots + out, slot.to(tl.int64))
+        tl.store(child_tokens + out, tl.load(candidates + batch_row * K + slot))
+        scores = tl.where(offsets == slot, float("-inf"), scores)
+
+
+class UnoRectifiedTreeChildren(msgspec.Struct, frozen=True):
+    """Per-parent tree children from the rectified lattice.
+
+    All tensors are [B, S, K, top]: entry (b, j, p, r) is the r-th best child
+    at draft depth j of a parent sitting at lattice slot p of depth j - 1
+    (slot 0 stands for the clean root at j = 0).
+    """
+
+    tokens: torch.Tensor
+    log_probs: torch.Tensor
+    slots: torch.Tensor
 
 
 class UnoRectifiedDrafts(msgspec.Struct, frozen=True):
@@ -262,6 +323,51 @@ class UnoRectifier:
             GREEDY=True,
         )
         return drafts
+
+
+    @torch.inference_mode()
+    def tree_children(
+        self,
+        *,
+        draft_logits: torch.Tensor,
+        root_tokens: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_k: int,
+    ) -> UnoRectifiedTreeChildren:
+        """Rectified top-``top_k`` children of every lattice parent.
+
+        ``draft_logits`` is [B, S, V] for the S tree depths below the clean
+        root ``root_tokens`` [B].  Each node's children are conditioned on the
+        node's own token, so a tree built from them follows the rectified
+        proposal instead of one shared candidate list per depth.
+        """
+        batch_size, num_rows, _ = draft_logits.shape
+        values, candidates, biases = self._build_lattice(draft_logits, root_tokens)
+        num_candidates = candidates.shape[-1]
+        if top_k > num_candidates:
+            raise ValueError(
+                f"tree top-k ({top_k}) exceeds the rectifier lattice "
+                f"({num_candidates} candidates)."
+            )
+        shape = (batch_size, num_rows, num_candidates, top_k)
+        tokens = torch.empty(shape, dtype=torch.int64, device=draft_logits.device)
+        slots = torch.empty_like(tokens)
+        log_probs = torch.empty(shape, dtype=torch.float32, device=draft_logits.device)
+        _tree_children_kernel[(batch_size * num_rows * num_candidates,)](
+            values,
+            candidates,
+            biases,
+            temperatures.reshape(batch_size).to(torch.float32).contiguous(),
+            tokens,
+            log_probs,
+            slots,
+            num_rows,
+            K=num_candidates,
+            TOP=top_k,
+            BLOCK_K=triton.next_power_of_2(num_candidates),
+            num_warps=2,
+        )
+        return UnoRectifiedTreeChildren(tokens=tokens, log_probs=log_probs, slots=slots)
 
 
 def _strip_rectifier_prefix(name: str) -> str:
