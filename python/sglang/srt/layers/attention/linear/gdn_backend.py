@@ -72,11 +72,12 @@ def _uses_linear_verify_conv(spec_info, window, width: int, retrieve_next_token)
     )
 
 
-def _verify_replayssm_launch(spec_info, batch_size: int) -> dict:
+def _verify_replayssm_launch(spec_info, batch_size: int, head_k_dim: int) -> dict:
     """UNO ReplaySSM verify launch config; others keep the kernel defaults.
 
     Measured on H200 for Qwen3.8-27B (HV 48, K=V 128, 8 verify tokens): the
-    default single-warp programs leave the 8-token verify latency-bound.
+    default single-warp programs leave the 8-token verify latency-bound, and
+    from batch 8 on four K chunks per program are fastest (b32 73 -> 54 us).
     """
     from sglang.srt.speculative.spec_info import SpecInputType
 
@@ -84,9 +85,11 @@ def _verify_replayssm_launch(spec_info, batch_size: int) -> dict:
         return {}
     if batch_size < 4:
         return {"block_v": 64, "num_warps": 4, "nk": 1}
-    if batch_size < 24:
+    if batch_size < 8:
         return {"block_v": 64, "num_warps": 2, "nk": 2}
-    return {"block_v": 128, "num_warps": 2, "nk": 2}
+    # tl.dot needs K chunks of at least 16 (K is padded to a power of two).
+    nk = 4 if head_k_dim > 32 else 2
+    return {"block_v": 128, "num_warps": 2, "nk": nk}
 
 
 class GDNMISMetadata(msgspec.Struct, frozen=True):
@@ -1195,7 +1198,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     query_start_loc=query_start_loc,
                     draft_token_num=forward_batch.spec_info.draft_token_num,
                     launch=_verify_replayssm_launch(
-                        forward_batch.spec_info, query_start_loc.shape[0] - 1
+                        forward_batch.spec_info,
+                        query_start_loc.shape[0] - 1,
+                        layer.head_k_dim,
                     ),
                 )
             else:
