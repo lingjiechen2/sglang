@@ -4,6 +4,10 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
+from sglang.kernels.ops.mamba.causal_conv1d_linear_verify import (
+    causal_conv1d_linear_verify,
+    is_dedup_conv_window,
+)
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     CAUSAL_CONV1D_FWD_BLOCK_M,
     causal_conv1d_fn,
@@ -52,6 +56,35 @@ _fused_decode_log_layer_hits = envs.SGLANG_GDN_DECODE_FUSION_LOG_LAYER_HITS.get(
 _fused_decode_verify_real_tensors = (
     envs.SGLANG_GDN_DECODE_FUSION_VERIFY_REAL_TENSORS.get()
 )
+
+
+
+
+def _uses_linear_verify_conv(spec_info, window, width: int, retrieve_next_token) -> bool:
+    """UNO's dense linear-chain verify writes the sliding conv window as one tile."""
+    from sglang.srt.speculative.spec_info import SpecInputType
+
+    return (
+        spec_info.spec_input_type in (SpecInputType.UNO_DRAFT, SpecInputType.UNO_VERIFY)
+        and retrieve_next_token is None
+        and window is not None
+        and is_dedup_conv_window(window, width)
+    )
+
+
+def _verify_replayssm_launch(spec_info, batch_size: int) -> dict:
+    """UNO ReplaySSM verify launch config; others keep the kernel defaults.
+
+    Measured on H200 for Qwen3.8-27B (HV 48, K=V 128, 8 verify tokens): the
+    default single-warp programs leave the 8-token verify latency-bound.
+    """
+    from sglang.srt.speculative.spec_info import SpecInputType
+
+    if spec_info.spec_input_type not in (SpecInputType.UNO_DRAFT, SpecInputType.UNO_VERIFY):
+        return {}
+    if batch_size < 4:
+        return {"block_v": 64, "num_warps": 4, "nk": 1}
+    return {"block_v": 64, "num_warps": 2, "nk": 2}
 
 
 class GDNMISMetadata(msgspec.Struct, frozen=True):
@@ -1045,19 +1078,36 @@ class GDNAttnBackend(MambaAttnBackendBase):
             mixed_qkv_reshaped = mixed_qkv.view(
                 batch_size, draft_token_num, -1
             ).transpose(1, 2)
-            mixed_qkv_processed = causal_conv1d_update(
-                mixed_qkv_reshaped,
-                conv_states,
-                layer.conv_weights,
-                layer.bias,
-                layer.activation,
-                conv_state_indices=cache_indices[:batch_size],
-                intermediate_conv_window=intermediate_conv_window_cache,
-                intermediate_state_indices=intermediate_state_indices[:batch_size],
-                retrieve_next_token=retrieve_next_token,
-                retrieve_next_sibling=retrieve_next_sibling,
-                retrieve_parent_token=retrieve_parent_token,
-            )
+            if _uses_linear_verify_conv(
+                forward_batch.spec_info,
+                intermediate_conv_window_cache,
+                layer.conv_weights.shape[-1],
+                retrieve_next_token,
+            ):
+                mixed_qkv_processed = causal_conv1d_linear_verify(
+                    mixed_qkv_reshaped,
+                    conv_states,
+                    layer.conv_weights,
+                    layer.bias,
+                    layer.activation,
+                    conv_state_indices=cache_indices[:batch_size],
+                    intermediate_conv_window=intermediate_conv_window_cache,
+                    intermediate_state_indices=intermediate_state_indices[:batch_size],
+                )
+            else:
+                mixed_qkv_processed = causal_conv1d_update(
+                    mixed_qkv_reshaped,
+                    conv_states,
+                    layer.conv_weights,
+                    layer.bias,
+                    layer.activation,
+                    conv_state_indices=cache_indices[:batch_size],
+                    intermediate_conv_window=intermediate_conv_window_cache,
+                    intermediate_state_indices=intermediate_state_indices[:batch_size],
+                    retrieve_next_token=retrieve_next_token,
+                    retrieve_next_sibling=retrieve_next_sibling,
+                    retrieve_parent_token=retrieve_parent_token,
+                )
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
             if forward_metadata.has_mamba_track_mask:
@@ -1134,6 +1184,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     replay_indices=forward_batch.req_pool_indices,
                     query_start_loc=query_start_loc,
                     draft_token_num=forward_batch.spec_info.draft_token_num,
+                    launch=_verify_replayssm_launch(
+                        forward_batch.spec_info, query_start_loc.shape[0] - 1
+                    ),
                 )
             else:
                 # The recurrent fallback needs the per-draft snapshots, which
@@ -1454,6 +1507,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         replay_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         draft_token_num: int,
+        launch: Optional[dict] = None,
     ) -> torch.Tensor:
         """ReplaySSM GDN spec-verify (Part B of #28511).
 
@@ -1523,6 +1577,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # Capacity folds are committed once across every GDN layer after
             # acceptance; the active path is therefore a single launch/layer.
             launch_mode="verify",
+            **(launch or {}),
         )
         # Match the recurrent target_verify output shape (== value.shape).
         return out.reshape(value.shape)
