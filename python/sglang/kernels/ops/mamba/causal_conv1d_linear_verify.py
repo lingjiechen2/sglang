@@ -13,6 +13,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.jit.utils import is_arch_support_pdl
+
 
 @triton.jit
 def _causal_conv1d_linear_verify_kernel(
@@ -45,7 +47,12 @@ def _causal_conv1d_linear_verify_kernel(
     HAS_BIAS: tl.constexpr,
     SILU: tl.constexpr,
     BLOCK_C: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
 ):
+    if USE_GDC:
+        # Programmatic dependent launch: start while the producer GEMM drains.
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     seq = tl.program_id(0)
     channels = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
     c_mask = channels < dim
@@ -163,7 +170,8 @@ def causal_conv1d_linear_verify(
         # Measured on H200 at dim 10240, F 8: small batches need more programs.
         block_c = 32 if batch < 4 else 128
     width = weight.shape[1]
-    out = torch.empty_like(x)
+    # Token-major like the dense verify input, also when x is a strided view.
+    out = x.new_empty(batch, F, dim).transpose(1, 2)
     window = intermediate_conv_window
     grid = (batch, triton.cdiv(dim, block_c))
     _causal_conv1d_linear_verify_kernel[grid](
@@ -183,5 +191,6 @@ def causal_conv1d_linear_verify(
         SILU=activation in ("silu", "swish"),
         BLOCK_C=block_c,
         num_warps=4,
+        **({"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}),
     )
     return out

@@ -18,7 +18,11 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.jit.utils import is_arch_support_pdl
+
 logger = logging.getLogger(__name__)
+
+_PDL_KWARGS = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
 
 
 @triton.jit
@@ -39,7 +43,12 @@ def _uno_lora_expand_kernel(
     NUM_BLOCKS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
 ):
+    if USE_GDC:
+        # Programmatic dependent launch: start while the producer GEMM drains.
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
     rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -96,8 +105,13 @@ def _uno_lora_expand_silu_mul_kernel(
     R: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
 ):
     """silu(gate) * up of a folded gate_up layer, LoRA added on draft rows."""
+    if USE_GDC:
+        # Programmatic dependent launch: start while the producer GEMM drains.
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
     rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -181,6 +195,7 @@ class UnoFusedLoRA(msgspec.Struct, frozen=True):
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             num_warps=4,
+            **_PDL_KWARGS,
         )
         return out
 
@@ -213,6 +228,7 @@ class UnoFusedLoRA(msgspec.Struct, frozen=True):
             BLOCK_N=block_n,
             num_warps=num_warps,
             num_stages=num_stages,
+            **_PDL_KWARGS,
         )
         return out
 
