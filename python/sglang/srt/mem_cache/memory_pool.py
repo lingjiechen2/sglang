@@ -648,6 +648,7 @@ class MambaPool:
         linear_replayssm_cache_len: int = 16,
         envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        skip_intermediate_ssm: bool = False,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -875,7 +876,9 @@ class MambaPool:
                 # KDA verify kernel takes intermediate_states_buffer=None (skips the
                 # per-step write, CACHE_INTERMEDIATE_STATES=False) and the commit
                 # replays the ring into the checkpoint instead. This is the memory win.
-                if enable_linear_replayssm_spec:
+                # UNO tree mode on GDN commits by path replay instead
+                # (sglang.srt.speculative.uno_tree_gdn).
+                if enable_linear_replayssm_spec or skip_intermediate_ssm:
                     intermediate_ssm_state_cache = None
                 else:
                     intermediate_ssm_state_cache = torch.zeros(
@@ -1396,7 +1399,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
         short_conv_state_shape: Optional[Tuple[int, int]] = None,
         ngram_context_len: int = 0,
         ngram_eos_token_id: int = 0,
+        skip_intermediate_ssm: bool = False,
     ):
+        self.skip_intermediate_ssm = skip_intermediate_ssm
         super().__init__(
             size=size,
             max_context_len=max_context_len,
@@ -1469,6 +1474,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
+            **(
+                {"skip_intermediate_ssm": True}
+                if getattr(self, "skip_intermediate_ssm", False)
+                else {}
+            ),
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,

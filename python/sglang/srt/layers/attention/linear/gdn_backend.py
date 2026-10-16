@@ -1046,6 +1046,32 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 and getattr(mamba_pool, "replayssm_cache_base", None) is not None
                 and not getattr(mamba_pool, "replayssm_is_kda", False)
             )
+            uno_tree_state = getattr(mamba_pool, "uno_tree_state", None)
+            if uno_tree_state is not None:
+                # UNO tree mode: ancestor-masked chunkwise verify, no
+                # per-node recurrent states (committed by path replay).
+                from sglang.srt.speculative.uno_tree_gdn import (
+                    uno_tree_gdn_target_verify,
+                )
+
+                num_nodes = forward_batch.spec_info.draft_token_num
+                batch_size = seq_len // num_nodes
+                return uno_tree_gdn_target_verify(
+                    state=uno_tree_state,
+                    layer=layer,
+                    layer_index=self.req_to_token_pool.mamba2_layer_index(
+                        layer.layer_id
+                    ),
+                    mixed_qkv=mixed_qkv,
+                    a=a,
+                    b=b,
+                    layer_cache=mamba_cache_params,
+                    cache_indices=cache_indices[:batch_size],
+                    scratch_rows=intermediate_state_indices[:batch_size],
+                    num_nodes=num_nodes,
+                    retrieve_next_token=retrieve_next_token,
+                    retrieve_next_sibling=retrieve_next_sibling,
+                )
 
         # Page-major envelope: the prefill kernels (CUDA causal_conv1d_fwd,
         # chunk_gated_delta_rule) write state back in place assuming a contiguous

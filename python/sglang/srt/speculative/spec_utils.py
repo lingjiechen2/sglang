@@ -980,6 +980,18 @@ def commit_mamba_states_after_verify(
         batch.req_pool_indices[:bs] if pp_spec_stable_rows_enabled() else None
     )
 
+    # UNO tree mode keeps no per-node states: replay the accepted path from
+    # the saved per-node inputs of the verify (sglang.srt.speculative.uno_tree_gdn).
+    if getattr(mamba_pool, "uno_tree_state", None) is not None:
+        if batch.forward_mode.is_idle() or accept_index.numel() == 0:
+            return
+        from sglang.srt.speculative.uno_tree_gdn import commit_uno_tree_after_verify
+
+        commit_uno_tree_after_verify(
+            req_pool, batch.req_pool_indices, accept_index, accept_lens, draft_token_num
+        )
+        return
+
     # Fold-every-commit: replay the accepted prefix from the ring into
     # `temporal`; the same fold stores the interval-crossing state to the
     # track slot, so no SSM scatter or force-flush is needed here.

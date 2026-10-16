@@ -1534,6 +1534,17 @@ class KVCacheConfigurator:
         )
         return req_to_token_pool
 
+    def _uno_tree_gdn_active(self) -> bool:
+        """UNO tree mode on a GDN hybrid keeps no per-node recurrent states
+        (sglang.srt.speculative.uno_tree_gdn)."""
+        spec = get_spec()
+        return (
+            self.hybrid_gdn_config is not None
+            and (spec.speculative_algorithm or "").upper() == "UNO"
+            and int(spec.speculative_eagle_topk or 1) > 1
+            and not _pd_prefill_skips_mamba_spec_state()
+        )
+
     def _build_hybrid_req_pool(
         self,
         *,
@@ -1585,6 +1596,11 @@ class KVCacheConfigurator:
                     self.hybrid_gdn_config is not None
                     or self.hybrid_kda_config is not None
                 )
+            ),
+            **(
+                {"skip_intermediate_ssm": True}
+                if self._uno_tree_gdn_active()
+                else {}
             ),
         )
         return req_to_token_pool
@@ -2932,6 +2948,23 @@ class KVCacheConfigurator:
         )
 
         has_spec_dec = not self.spec_algorithm.is_none()
+        # UNO tree on GDN: per draft node only the conv window and the saved
+        # raw k/v/g/beta, not a full recurrent state.
+        uno_tree_gdn = has_spec_dec and self._uno_tree_gdn_active()
+        if uno_tree_gdn:
+            params = config.mamba2_cache_params
+            hv, v_dim, k_dim = params.shape.temporal
+            conv_b = params.dtype.conv.itemsize
+            conv_numel = sum(int(math.prod(shape)) for shape in params.shape.conv)
+            uno_tree_node_bytes = int(
+                (
+                    conv_numel * conv_b
+                    + (params.shape.num_k_heads_per_tp * k_dim + hv * v_dim) * conv_b
+                    + hv * 8
+                )
+                * len(params.layers)
+                * pp_layer_scale
+            )
         # ReplaySSM drops the per-step intermediate_ssm scratch, so its mamba budget
         # no longer reserves the (1 + D/ratio) intermediate factor -- the whole
         # budget goes to persistent slots (K sized like non-spec), which is how the
@@ -2989,7 +3022,7 @@ class KVCacheConfigurator:
                     get_schedule().max_mamba_cache_size // ratio,
                 )
                 intermediate_size = (
-                    stage_per_req
+                    (uno_tree_node_bytes if uno_tree_gdn else stage_per_req)
                     * (capped_reqs + 1)
                     * get_spec().speculative_num_draft_tokens
                 )
@@ -3008,7 +3041,7 @@ class KVCacheConfigurator:
             # pool's padding slot). Skipped under replayssm and on PD prefill.
             if reserves_spec_state:
                 intermediate_size = (
-                    stage_per_req
+                    (uno_tree_node_bytes if uno_tree_gdn else stage_per_req)
                     * (get_schedule().max_mamba_cache_size + 1)
                     * get_spec().speculative_num_draft_tokens
                 )
@@ -3031,12 +3064,20 @@ class KVCacheConfigurator:
                 ratio = self._calculate_mamba_ratio()
                 D = get_spec().speculative_num_draft_tokens
                 # Joint solve: main_state + intermediate = mamba_budget
-                get_context().override(
-                    "mamba_pool.memory_budget_spec",
-                    max_mamba_cache_size=int(
+                if uno_tree_gdn:
+                    node = uno_tree_node_bytes
+                    max_mamba = int(
+                        (mamba_budget_bytes - per_req - node * D - extra_per_slot)
+                        // (per_req + node * D / ratio + extra_per_slot)
+                    )
+                else:
+                    max_mamba = int(
                         (mamba_budget_bytes - per_req * (1 + D) - extra_per_slot)
                         // (per_req * (1 + D / ratio) + extra_per_slot)
-                    ),
+                    )
+                get_context().override(
+                    "mamba_pool.memory_budget_spec",
+                    max_mamba_cache_size=max_mamba,
                 )
                 # Intermediate memory is included in mamba_budget, subtract it
                 # so the return value only has main_state subtracted from total
@@ -3044,7 +3085,9 @@ class KVCacheConfigurator:
                     get_schedule().max_running_requests // self.attn_dp_size,
                     get_schedule().max_mamba_cache_size // ratio,
                 )
-                intermediate_size = per_req * (capped_reqs + 1) * D
+                intermediate_size = (
+                    uno_tree_node_bytes if uno_tree_gdn else per_req
+                ) * (capped_reqs + 1) * D
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
             else:
                 per_slot = per_req + extra_per_slot

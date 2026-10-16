@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.configs.hybrid_arch import mambaish_config
+from sglang.srt.configs.hybrid_arch import hybrid_gdn_config, mambaish_config
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -38,6 +38,10 @@ from sglang.srt.speculative.uno_cuda_graph_runner import (
 from sglang.srt.speculative.uno_info import UnoDraftInput, UnoForwardInput
 from sglang.srt.speculative.uno_rectifier import UnoRectifier, load_uno_rectifier
 from sglang.srt.speculative.uno_tree import build_uno_tree_proposal
+from sglang.srt.speculative.uno_tree_gdn import (
+    commit_uno_tree_path,
+    enable_uno_tree_gdn,
+)
 from sglang.srt.speculative.uno_utils import (
     build_uno_draft_input,
     pack_uno_tree_result,
@@ -183,6 +187,17 @@ class UnoWorkerV2(BaseSpecWorker):
             raise NotImplementedError(
                 "UNO tree mode on linear-attention models needs the recurrent "
                 "verify; drop --enable-linear-replayssm-spec."
+            )
+        if self._commits_mamba_state and self.tree_mode:
+            if hybrid_gdn_config(self.model_runner.model_config) is None:
+                raise NotImplementedError(
+                    "UNO tree mode supports GDN linear attention only."
+                )
+            # Tree verify without per-node recurrent states; see uno_tree_gdn.
+            enable_uno_tree_gdn(
+                self.model_runner.req_to_token_pool,
+                self.verify_width,
+                max_depth=self.forward_width - 1,
             )
         if self._commits_mamba_state and get_exec().mamba.enable_mamba_extra_buffer:
             raise NotImplementedError(
@@ -570,16 +585,14 @@ class UnoWorkerV2(BaseSpecWorker):
             -1,
         )
         if self._commits_mamba_state:
-            # The seed row is the only real token of the draft pass; commit it
-            # through the draft backend that holds this pass's state indices.
-            # EAGLE's tree verify then commits the accepted path itself.
-            with self._bind_uno_draft_runtime():
-                self._commit_mamba_state(
-                    batch=batch,
-                    num_commit_rows=torch.ones(
-                        batch_size, dtype=torch.int64, device=self.device
-                    ),
-                )
+            # The seed row is the only real token of the draft pass; EAGLE's
+            # tree verify then commits the accepted path itself.
+            commit_uno_tree_path(
+                self.model_runner.req_to_token_pool,
+                batch.req_pool_indices,
+                path=torch.zeros((batch_size, 1), dtype=torch.int32, device=self.device),
+                path_lens=torch.ones(batch_size, dtype=torch.int32, device=self.device),
+            )
 
         sampling_info = batch.sampling_info
         if sampling_info.is_all_greedy:
