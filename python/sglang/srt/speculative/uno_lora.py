@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from typing import TYPE_CHECKING
 
 from sglang.srt.lora.lora_manager import LoRAManager
@@ -11,6 +13,8 @@ from sglang.srt.runtime_context import get_spec
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
+
+logger = logging.getLogger(__name__)
 
 # This name is internal to the model-execution process. It is never exposed as
 # a request-selectable serving adapter.
@@ -57,8 +61,58 @@ def init_uno_lora_manager(
     #   None             -> base model
     #   uno_ref.lora_id  -> base model + UNO draft LoRA
     manager.fetch_new_loras({None, uno_ref.lora_id})
+    if get_spec().uno_fused_lora:
+        _fold_uno_lora(manager, uno_ref.lora_id)
 
     return manager, uno_ref.lora_id
+
+
+def _fold_uno_lora(manager: LoRAManager, lora_id: str) -> None:
+    """Fold the resident UNO adapter's LoRA-A rows into each base GEMM."""
+    from sglang.srt.lora.backend.uno_fused_lora import (
+        fold_uno_lora_group,
+        fold_uno_lora_layer,
+    )
+    from sglang.srt.models.qwen3_5 import Qwen3_5GatedDeltaNet
+
+    adapter = manager.loras[lora_id]
+    fold_kwargs = dict(
+        weight_index=manager.memory_pool.uid_to_buffer_id[lora_id],
+        rank=adapter.config.r,
+        scaling=adapter.scaling,
+    )
+    grouped: set[int] = set()
+    num_groups = 0
+    # GDN input projections share one input; fold qkvz|ba like the base fused GEMM.
+    for module in manager.base_model.modules():
+        if not isinstance(module, Qwen3_5GatedDeltaNet):
+            continue
+        members = [module.in_proj_qkvz, module.in_proj_ba]
+        fused = fold_uno_lora_group(members, **fold_kwargs)
+        if fused is None:
+            continue
+        module.uno_fused_in_proj = fused
+        grouped.update(id(member) for member in members)
+        num_groups += 1
+
+    num_folded = num_kept = 0
+    for layer_modules in manager.lora_modules:
+        for module in layer_modules.values():
+            if id(module) in grouped:
+                continue
+            fused = fold_uno_lora_layer(module, **fold_kwargs)
+            if fused is None:
+                num_kept += 1
+                continue
+            module.uno_fused = fused
+            num_folded += 1
+    logger.info(
+        "UNO fused LoRA: %d GDN input groups, %d single layers folded, "
+        "%d keep the unfused path.",
+        num_groups,
+        num_folded,
+        num_kept,
+    )
 
 
 class UnoCudaGraphLoRAState:

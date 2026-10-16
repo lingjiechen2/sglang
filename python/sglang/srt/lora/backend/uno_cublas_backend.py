@@ -446,6 +446,10 @@ class UnoCublasLoRABackend(TritonLoRABackend):
             producer_stream=stream,
         )
 
+    def run_uno_fused_lora(self, fused, x: torch.Tensor) -> torch.Tensor:
+        """One folded base+LoRA-A GEMM and the LoRA-B expand (``--uno-fused-lora``)."""
+        return fused.forward(x, forward_width=self._route().forward_width)
+
     def _consume_lora_a_overlap(
         self,
         pending: _PendingLoRAA,

@@ -47,6 +47,8 @@ class BaseLayerWithLoRA(nn.Module):
         self.base_layer: nn.Module = base_layer
         self.set_lora: bool = False
         self.lora_backend: BaseLoRABackend = lora_backend
+        # Set only by UNO's --uno-fused-lora: LoRA-A folded into the base GEMM.
+        self.uno_fused = None
         if hasattr(self.base_layer, "weight"):
             self.weight = self.base_layer.weight
         if hasattr(self.base_layer, "bias") and self.base_layer.bias is not None:
@@ -497,6 +499,10 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
     def forward(self, input_: torch.Tensor):
         # duplicate the logic in ColumnParallelLinear
         lora_active = self.lora_active
+        if lora_active and self.uno_fused is not None:
+            output = self.lora_backend.run_uno_fused_lora(self.uno_fused, input_)
+            output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
+            return output, output_bias
         if lora_active:
             self.start_lora_a_overlap(input_)
 
@@ -813,6 +819,10 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             input_parallel = splitted_input[tp_rank].contiguous()
 
         lora_active = self.lora_active
+        if lora_active and self.uno_fused is not None:
+            output_ = self.lora_backend.run_uno_fused_lora(self.uno_fused, input_parallel)
+            output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
+            return output_, output_bias
         if lora_active:
             self.start_lora_a_overlap(input_parallel)
 

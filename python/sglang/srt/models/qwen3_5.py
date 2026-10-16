@@ -427,6 +427,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self._bind_packed_weight_loaders(self.in_proj_qkvz)
         self._bind_packed_weight_loaders(self.in_proj_ba)
         self._fused_in_proj_weight: Optional[torch.Tensor] = None
+        # Set only by UNO's --uno-fused-lora: qkvz|ba and their draft LoRA-A
+        # folded into one weight (see lora/backend/uno_fused_lora.py).
+        self.uno_fused_in_proj = None
         self._fused_in_proj_qkvz_width = 0
         self._fused_in_proj_ba_width = 0
         self._fused_in_proj_scale: Optional[torch.Tensor] = None
@@ -814,6 +817,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
 
     def _forward_input_proj(self, hidden_states: torch.Tensor):
+        if self.uno_fused_in_proj is not None:
+            return self._forward_input_proj_uno(hidden_states)
         if _use_aiter and self._fused_in_proj_weight is not None:
             # Unquantized BF16 projections consume the bf16 side of the fused
             # AR+RMSNorm tuple; one aiter GEMM replaces the two separate
@@ -910,6 +915,19 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
             projected_states_ba, _ = self.in_proj_ba(hidden_states)
         return projected_states_qkvz, projected_states_ba
+
+    def _forward_input_proj_uno(self, hidden_states: torch.Tensor):
+        """qkvz and ba from UNO's folded weight: base-only rows run the plain
+        fused GEMM; draft rows add the LoRA-B expand."""
+        fused = self.uno_fused_in_proj
+        if self.in_proj_qkvz.lora_active:
+            out = self.in_proj_qkvz.lora_backend.run_uno_fused_lora(
+                fused, hidden_states
+            )
+        else:
+            out = fused.base_forward(hidden_states)
+        qkvz_width = fused.out_splits[0]
+        return out[:, :qkvz_width], out[:, qkvz_width:]
 
     def _forward_input_proj_fused_quant_amd(self, hidden_states):
         """AMD-only variant for the fused AR+RMSNorm+per-group-quant path.

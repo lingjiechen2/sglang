@@ -40,6 +40,12 @@ class Spec(msgspec.Struct):
         "UNO drafts on the previous draft token. Startup fails if the files are "
         "missing. Verification stays lossless either way.",
     ] = False
+    uno_fused_lora: A[
+        bool,
+        "Fold UNO's draft LoRA-A into each base GEMM and apply LoRA-B with one "
+        "fused kernel per layer, instead of separate LoRA GEMMs. Changes only "
+        "how draft forwards execute; base-only forwards are unchanged.",
+    ] = False
     speculative_draft_model_path: A[
         Optional[str],
         Arg(
