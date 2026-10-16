@@ -210,6 +210,7 @@ class LoRAAdapter(nn.Module):
             self._normalize_in_proj(layer.weights)
             # Stack in_proj_q + in_proj_k + in_proj_v + in_proj_z → in_proj_qkvz for GDN layers
             self._normalize_in_proj_qkvz(layer.weights)
+            self._normalize_in_proj_ba(layer.weights)
             weight_names = list(layer.weights.keys())
             self.normalize_gate_up_proj(weight_names, layer.weights)
             weight_names = list(layer.weights.keys())
@@ -450,6 +451,17 @@ class LoRAAdapter(nn.Module):
                 weights.pop(k_name)
                 weights.pop(v_name)
                 weights.pop(z_name)
+            elif "in_proj_qkv." in weight_name:
+                # HF Qwen3.5 layout: one adapter on the joint q|k|v output and
+                # one on z. The q, k and v slots share the in_proj_qkv A.
+                z_name = weight_name.replace("in_proj_qkv", "in_proj_z")
+                if z_name not in weights:
+                    continue
+                qkvz_name = weight_name.replace("in_proj_qkv", "in_proj_qkvz")
+                cat_dim = weights[weight_name].dim() - 2
+                qkv, z = weights.pop(weight_name), weights.pop(z_name)
+                parts = (qkv, qkv, qkv, z) if "lora_A" in weight_name else (qkv, z)
+                weights[qkvz_name] = torch.cat(parts, cat_dim)
             elif "in_proj_qkvz" in weight_name and "lora_A" in weight_name:
                 # Already-merged adapter: replicate the shared A across the 4
                 # stacked slots the buffer expects (q, k, v, z).
@@ -458,6 +470,20 @@ class LoRAAdapter(nn.Module):
                 repeat_dims[ndim - 2] = 4
                 weights[weight_name] = weights[weight_name].repeat(*repeat_dims)
             # else (in_proj_qkvz lora_B, or unrelated): no-op.
+
+    def _normalize_in_proj_ba(self, weights: Dict[str, torch.Tensor]):
+        """Stack GDN ``in_proj_b`` and ``in_proj_a`` adapters into the fused
+        ``in_proj_ba`` (b rows first, matching the base layer's shard order)."""
+        for weight_name in list(weights.keys()):
+            if "in_proj_b." not in weight_name:
+                continue
+            a_name = weight_name.replace("in_proj_b.", "in_proj_a.")
+            if a_name not in weights:
+                continue
+            cat_dim = weights[weight_name].dim() - 2
+            weights[weight_name.replace("in_proj_b.", "in_proj_ba.")] = torch.cat(
+                (weights.pop(weight_name), weights.pop(a_name)), cat_dim
+            )
 
     def normalize_gate_up_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
