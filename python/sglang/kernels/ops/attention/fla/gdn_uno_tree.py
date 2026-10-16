@@ -116,6 +116,8 @@ def _uno_tree_conv_kernel(
     stride_win_pos,
     window_rows,  # [B]
     parents,  # [B, NODE_STRIDE] int32 (IS_TREE)
+    seed_x,  # [rows, dim] raw input of the seed token (SAVE_SEED / HAS_SEED)
+    stride_seed,
     dim,
     Q: tl.constexpr,
     NODE_STRIDE: tl.constexpr,
@@ -124,6 +126,8 @@ def _uno_tree_conv_kernel(
     HAS_BIAS: tl.constexpr,
     SILU: tl.constexpr,
     IS_TREE: tl.constexpr,
+    SAVE_SEED: tl.constexpr,
+    HAS_SEED: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     seq = row // Q
@@ -138,24 +142,42 @@ def _uno_tree_conv_kernel(
     if HAS_BIAS:
         acc += tl.load(bias + channels, mask=c_mask, other=0.0).to(tl.float32)
     # Level 0 is the node, level l its l-th ancestor; past the root the taps
-    # continue into the conv state, newest column first (cur = -1, -2, ...).
+    # continue with the uncommitted seed token (HAS_SEED) and then the conv
+    # state, newest column first (cur = -1, -2, ...).
     cur = node
     for level in tl.static_range(W):
         from_x = cur >= 0
         safe = tl.maximum(cur, 0)
+        missing = tl.maximum(-cur, 0)
+        if HAS_SEED:
+            from_seed = cur == -1
+            state_col = W - missing
+        else:
+            from_seed = cur < -W
+            state_col = W - 1 - missing
         tap = tl.load(
             x + (seq * Q + safe) * stride_x + channels,
             mask=c_mask & from_x,
             other=0.0,
         )
         tap += tl.load(
+            seed_x + win_row * stride_seed + channels,
+            mask=c_mask & valid & from_seed,
+            other=0.0,
+        )
+        tap += tl.load(
             conv_state
             + slot * stride_cs_slot
             + channels * stride_cs_dim
-            + (W - 1 + tl.minimum(cur, -1)) * stride_cs_win,
-            mask=c_mask & valid & (cur < 0),
+            + tl.maximum(state_col, 0) * stride_cs_win,
+            mask=c_mask & valid & (cur < 0) & (from_seed == 0),
             other=0.0,
         )
+        if SAVE_SEED:
+            if level == 0:
+                # The draft pass's row 0 is the seed; tree verify consumes it.
+                tl.store(seed_x + win_row * stride_seed + channels, tap,
+                         mask=c_mask & valid & (node == 0))
         w = tl.load(weight + channels * stride_w_dim + (W - 1 - level) * stride_w_tap,
                     mask=c_mask, other=0.0)
         acc += tap.to(tl.float32) * w.to(tl.float32)
@@ -191,7 +213,12 @@ def uno_tree_conv(
     window_rows: torch.Tensor,  # [B]
     num_nodes: int,
     parents: Optional[torch.Tensor] = None,  # [B, node_stride]; None = chain
+    seed_x: Optional[torch.Tensor] = None,  # [rows, dim]
+    save_seed: bool = False,
+    has_seed: bool = False,
 ) -> torch.Tensor:
+    """``save_seed``: store row 0's input (the draft seed) into ``seed_x``;
+    ``has_seed``: the seed precedes the root (its state is not committed)."""
     tokens, dim = x.shape
     assert x.stride(1) == 1 and tokens % num_nodes == 0
     batch = tokens // num_nodes
@@ -209,6 +236,8 @@ def uno_tree_conv(
         window, window.stride(0), window.stride(1), window.stride(2), window.stride(3),
         window_rows,
         parents if is_tree else cache_indices,
+        seed_x if seed_x is not None else x,
+        seed_x.stride(0) if seed_x is not None else 0,
         dim,
         Q=num_nodes,
         NODE_STRIDE=parents.stride(0) if is_tree else 0,
@@ -217,6 +246,8 @@ def uno_tree_conv(
         HAS_BIAS=bias is not None,
         SILU=activation in ("silu", "swish"),
         IS_TREE=is_tree,
+        SAVE_SEED=save_seed,
+        HAS_SEED=has_seed,
         num_warps=4,
     )
     return out
@@ -235,6 +266,9 @@ def _uno_tree_gdn_verify_kernel(
     save_rows,  # [B]
     ancestors,  # [B, ANC_STRIDE] int64 ancestor bits (IS_TREE)
     scale,
+    SAVE_OFFSET: tl.constexpr,
+    SEED_NODE: tl.constexpr,
+    HAS_SEED: tl.constexpr,
     Q: tl.constexpr,
     QP: tl.constexpr,
     NODE_STRIDE: tl.constexpr,
@@ -298,6 +332,14 @@ def _uno_tree_gdn_verify_kernel(
     k_sq = tl.zeros([QP], dtype=tl.float32)
     q_sq = tl.zeros([QP], dtype=tl.float32)
     store_k = (i_v == 0) & (i_hv % (HV // H) == 0) & (save_row >= 0)
+    if HAS_SEED:
+        # The seed token sits between the committed state S0 and the root:
+        # S1 = e^{g_s} S0 + k_s u_s^T, folded in below.
+        seed_row = save_row * NODE_STRIDE + SEED_NODE
+        kks = tl.zeros([QP], dtype=tl.float32)
+        qks = tl.zeros([QP], dtype=tl.float32)
+        kss = tl.zeros([BV], dtype=tl.float32)
+        ss_sq = 0.0
     for kc in tl.static_range(0, K, BK):
         o_k = kc + tl.arange(0, BK)
         k_raw = tl.load(k + rows[:, None] * stride_k + i_h * K + o_k[None, :],
@@ -306,7 +348,7 @@ def _uno_tree_gdn_verify_kernel(
                       mask=q_ok[:, None], other=0.0).to(tl.float32)
         b_k = k_raw.to(tl.float32)
         if store_k:
-            tl.store(saved_k + (save_row * NODE_STRIDE + o_q[:, None]) * (H * K)
+            tl.store(saved_k + (save_row * NODE_STRIDE + SAVE_OFFSET + o_q[:, None]) * (H * K)
                      + i_h * K + o_k[None, :], k_raw, mask=q_ok[:, None])
         k_sq += tl.sum(b_k * b_k, axis=1)
         q_sq += tl.sum(b_q * b_q, axis=1)
@@ -317,17 +359,32 @@ def _uno_tree_gdn_verify_kernel(
                      mask=(slot >= 0) & (o_v[None, :] < V), other=0.0).to(tl.float32)
         ks += tl.dot(b_k, h0, input_precision=PRECISION)
         qs += tl.dot(b_q, h0, input_precision=PRECISION)
+        if HAS_SEED:
+            k_s = tl.load(saved_k + seed_row * (H * K) + i_h * K + o_k).to(tl.float32)
+            ss_sq += tl.sum(k_s * k_s)
+            kks += tl.sum(b_k * k_s[None, :], axis=1)
+            qks += tl.sum(b_q * k_s[None, :], axis=1)
+            kss += tl.sum(k_s[:, None] * h0, axis=0)
     r_k = 1.0 / tl.sqrt(k_sq + 1e-6)
     r_q = scale / tl.sqrt(q_sq + 1e-6)
     kk = kk * r_k[:, None] * r_k[None, :]
     qk = qk * r_q[:, None] * r_k[None, :]
     ks = ks * r_k[:, None]
     qs = qs * r_q[:, None]
+    if HAS_SEED:
+        r_s = 1.0 / tl.sqrt(ss_sq + 1e-6)
+        g_s = tl.load(saved_g + seed_row * HV + i_hv)
+        beta_s = tl.load(saved_beta + seed_row * HV + i_hv)
+        v_s = tl.load(saved_v + seed_row * (HV * V) + i_hv * V + o_v).to(tl.float32)
+        decay_s = tl.exp(g_s)
+        u_s = beta_s * (v_s - decay_s * kss * r_s)
+        ks = decay_s * ks + (kks * r_k * r_s)[:, None] * u_s[None, :]
+        qs = decay_s * qs + (qks * r_q * r_s)[:, None] * u_s[None, :]
 
     v_raw = tl.load(v + rows[:, None] * stride_v + i_hv * V + o_v[None, :],
                     mask=q_ok[:, None], other=0.0)
     if save_row >= 0:
-        node_rows = save_row * NODE_STRIDE + o_q
+        node_rows = save_row * NODE_STRIDE + SAVE_OFFSET + o_q
         tl.store(saved_v + node_rows[:, None] * (HV * V) + i_hv * V + o_v[None, :],
                  v_raw, mask=q_ok[:, None])
         if i_v == 0:
@@ -376,6 +433,8 @@ def uno_tree_gdn_verify(
     num_warps: Optional[int] = None,
     block_k: int = 64,
     precision: str = "tf32",
+    save_offset: int = 0,
+    seed_node: Optional[int] = None,
 ) -> torch.Tensor:
     """``max_depth`` bounds the deepest node (root = 0); defaults to Q - 1."""
     tokens = q.shape[0]
@@ -407,6 +466,9 @@ def uno_tree_gdn_verify(
         save_rows,
         ancestors if is_tree else cache_indices,
         scale,
+        SAVE_OFFSET=save_offset,
+        SEED_NODE=seed_node if seed_node is not None else 0,
+        HAS_SEED=seed_node is not None,
         Q=num_nodes,
         QP=qp,
         NODE_STRIDE=node_stride,
@@ -438,6 +500,8 @@ def _uno_tree_gdn_commit_kernel(
     path,  # [B, P] accepted nodes in order, root first
     stride_path,
     path_lens,  # [B]
+    SEED_NODE: tl.constexpr,
+    HAS_SEED: tl.constexpr,
     NODE_STRIDE: tl.constexpr,
     H: tl.constexpr,
     HV: tl.constexpr,
@@ -455,14 +519,22 @@ def _uno_tree_gdn_commit_kernel(
     slot = tl.load(state_indices + i_b).to(tl.int64)
     save_row = tl.load(save_rows + i_b).to(tl.int64)
     n = tl.load(path_lens + i_b)
-    if (slot >= 0) & (save_row >= 0) & (n > 0):
+    if (slot >= 0) & (save_row >= 0) & ((n > 0) | HAS_SEED):
         o_k = tl.arange(0, K)
         o_v = i_v * BV + tl.arange(0, BV)
         p_h = (state + layer * stride_state_layer + slot * stride_state_slot
                + i_hv * K * V + o_v[None, :] * K + o_k[:, None])
         h = tl.load(p_h)
-        for s in range(0, n):
-            node = tl.load(path + i_b * stride_path + s).to(tl.int64)
+        if HAS_SEED:
+            n_steps = n + 1
+        else:
+            n_steps = n
+        for s in range(0, n_steps):
+            if HAS_SEED:
+                node = tl.load(path + i_b * stride_path + tl.maximum(s - 1, 0)).to(tl.int64)
+                node = tl.where(s == 0, SEED_NODE, node)
+            else:
+                node = tl.load(path + i_b * stride_path + s).to(tl.int64)
             r = save_row * NODE_STRIDE + node
             b_k = tl.load(saved_k + layer * stride_sk_layer + r * (H * K) + i_h * K + o_k).to(tl.float32)
             b_v = tl.load(saved_v + layer * stride_sv_layer + r * (HV * V) + i_hv * V + o_v).to(tl.float32)
@@ -488,7 +560,9 @@ def uno_tree_gdn_commit(
     path_lens: torch.Tensor,  # [B]
     node_stride: int,
     num_k_heads: int,
+    seed_node: Optional[int] = None,
 ) -> None:
+    """``seed_node``: replay that saved node before the path (merged seed)."""
     layers, _, num_v_heads, head_v_dim, head_k_dim = state.shape
     batch = state_indices.shape[0]
     if batch == 0:
@@ -502,6 +576,8 @@ def uno_tree_gdn_commit(
         saved_k.stride(0), saved_v.stride(0), saved_g.stride(0),
         state_indices, save_rows,
         path, path.stride(0), path_lens,
+        SEED_NODE=seed_node if seed_node is not None else 0,
+        HAS_SEED=seed_node is not None,
         NODE_STRIDE=node_stride,
         H=num_k_heads,
         HV=num_v_heads,

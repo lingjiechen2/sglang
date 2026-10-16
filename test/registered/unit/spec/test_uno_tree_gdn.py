@@ -188,6 +188,88 @@ class TestUnoTreeGdn(CustomTestCase):
         untouched[cache_indices.long()] = False
         torch.testing.assert_close(committed[untouched], state[untouched], rtol=0, atol=0)
 
+    def test_tree_after_uncommitted_seed(self):
+        """Draft chain saves its seed; the tree verify and the commit fold the
+        seed in without it ever being committed on its own."""
+        torch.manual_seed(3)
+        H, HV, K, V, W = self.H, self.HV, self.K, self.V, self.W
+        batch, F, Q = 3, 8, 16
+        dim = 2 * H * K + HV * V
+        slots, offset = batch + 2, Q
+        node_stride = Q + F
+        cache_indices = torch.randperm(slots, device=_DEVICE)[:batch].to(torch.int32)
+        rows = torch.arange(batch, device=_DEVICE, dtype=torch.int32)
+        conv_state = torch.randn(slots, W - 1, dim, device=_DEVICE, dtype=torch.bfloat16).transpose(1, 2)
+        weight = torch.randn(dim, W, device=_DEVICE, dtype=torch.bfloat16) * 0.5
+        A_log = torch.rand(HV, device=_DEVICE) * 0.5
+        dt_bias = torch.rand(HV, device=_DEVICE)
+        state = torch.randn(slots, HV, V, K, device=_DEVICE) * 0.05
+        saved = dict(
+            saved_k=torch.empty(1, (batch + 1) * node_stride, H * K, device=_DEVICE, dtype=torch.bfloat16),
+            saved_v=torch.empty(1, (batch + 1) * node_stride, HV * V, device=_DEVICE, dtype=torch.bfloat16),
+            saved_g=torch.empty(1, (batch + 1) * node_stride, HV, device=_DEVICE),
+        )
+        saved["saved_beta"] = torch.empty_like(saved["saved_g"])
+        seed_x = torch.empty(batch + 1, dim, device=_DEVICE, dtype=torch.bfloat16)
+        window = torch.zeros(batch + 1, Q, dim, W - 1, device=_DEVICE, dtype=torch.bfloat16)
+
+        def run(x, a, b, num_nodes, parents_buf, anc_buf, **kw):
+            conv = uno_tree_conv(x, conv_state, weight, None, "silu", cache_indices, window,
+                                 rows, num_nodes, parents_buf, seed_x=seed_x,
+                                 save_seed=kw["save_seed"], has_seed=kw["has_seed"])
+            q, k, v = conv.split([H * K, H * K, HV * V], dim=-1)
+            out = uno_tree_gdn_verify(
+                q, k, v, a, b, A_log, dt_bias, state, cache_indices,
+                saved["saved_k"][0], saved["saved_v"][0], saved["saved_g"][0],
+                saved["saved_beta"][0], rows, num_nodes=num_nodes, node_stride=node_stride,
+                num_k_heads=H, head_k_dim=K, head_v_dim=V, ancestors=anc_buf,
+                max_depth=F - 1, save_offset=kw["offset"], seed_node=kw["seed"])
+            return conv, q, k, v, out
+
+        # Draft chain (F rows) from the committed state.
+        xd = torch.randn(batch * F, dim, device=_DEVICE, dtype=torch.bfloat16)
+        ad = torch.randn(batch * F, HV, device=_DEVICE, dtype=torch.bfloat16)
+        bd = torch.randn(batch * F, HV, device=_DEVICE, dtype=torch.bfloat16)
+        chain_parents = torch.arange(-1, F - 1).repeat(batch, 1)
+        _, qd, kd, vd, _ = run(xd, ad, bd, F, None, None, save_seed=True, has_seed=False,
+                               offset=offset, seed=None)
+        _, chain_windows = _reference_conv(xd, conv_state, weight, cache_indices,
+                                           chain_parents, batch, F)
+        _, chain_states = _reference_rule(qd, kd, vd, ad, bd, A_log, dt_bias, state,
+                                          cache_indices, chain_parents, batch, F, H, HV, K, V)
+        # Reference committed state after the seed alone.
+        state1, conv1 = state.clone(), conv_state.clone()
+        for bi in range(batch):
+            state1[int(cache_indices[bi])] = chain_states[bi, 0]
+            conv1[int(cache_indices[bi])] = chain_windows[bi, 0]
+
+        # Tree verify from the uncommitted state with the seed folded in.
+        parents, next_token, next_sibling = _random_tree(batch, Q, chain=False)
+        parent_buf = torch.empty(batch + 1, Q, dtype=torch.int32, device=_DEVICE)
+        anc_buf = torch.empty(batch + 1, Q, dtype=torch.int64, device=_DEVICE)
+        uno_tree_structure(next_token, next_sibling, parent_buf, anc_buf, Q, max_depth=Q - 1)
+        xt = torch.randn(batch * Q, dim, device=_DEVICE, dtype=torch.bfloat16)
+        at = torch.randn(batch * Q, HV, device=_DEVICE, dtype=torch.bfloat16)
+        bt = torch.randn(batch * Q, HV, device=_DEVICE, dtype=torch.bfloat16)
+        conv_t, qt, kt, vt, out_t = run(xt, at, bt, Q, parent_buf[:batch], anc_buf[:batch],
+                                        save_seed=False, has_seed=True, offset=0, seed=offset)
+        ref_conv, ref_windows = _reference_conv(xt, conv1, weight, cache_indices, parents, batch, Q)
+        torch.testing.assert_close(conv_t.float(), ref_conv, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(window[:batch], ref_windows, rtol=0, atol=0)
+        ref_out, tree_states = _reference_rule(qt, kt, vt, at, bt, A_log, dt_bias, state1,
+                                               cache_indices, parents, batch, Q, H, HV, K, V)
+        torch.testing.assert_close(out_t.float(), ref_out, rtol=3e-2, atol=3e-2)
+
+        # One commit: seed + accepted path, from the never-advanced state.
+        path, lens = _paths(parents, batch, Q)
+        last = path.gather(1, (lens - 1).long()[:, None])[:, 0].long()
+        committed = state.clone()
+        uno_tree_gdn_commit(committed.unsqueeze(0), saved["saved_k"], saved["saved_v"],
+                            saved["saved_g"], saved["saved_beta"], cache_indices, rows,
+                            path, lens, node_stride=node_stride, num_k_heads=H, seed_node=offset)
+        expected = tree_states[torch.arange(batch, device=_DEVICE), last]
+        torch.testing.assert_close(committed[cache_indices.long()], expected, rtol=1e-4, atol=1e-4)
+
     def test_tree_q16(self):
         self._case(batch=3, num_nodes=16, chain=False, seed=0)
 
