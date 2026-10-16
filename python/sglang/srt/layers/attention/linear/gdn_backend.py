@@ -84,7 +84,9 @@ def _verify_replayssm_launch(spec_info, batch_size: int) -> dict:
         return {}
     if batch_size < 4:
         return {"block_v": 64, "num_warps": 4, "nk": 1}
-    return {"block_v": 64, "num_warps": 2, "nk": 2}
+    if batch_size < 24:
+        return {"block_v": 64, "num_warps": 2, "nk": 2}
+    return {"block_v": 128, "num_warps": 2, "nk": 2}
 
 
 class GDNMISMetadata(msgspec.Struct, frozen=True):
