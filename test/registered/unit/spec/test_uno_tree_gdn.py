@@ -120,8 +120,8 @@ class TestUnoTreeGdn(CustomTestCase):
         parents, next_token, next_sibling = _random_tree(batch, num_nodes, chain)
         parent_buf = ancestor_buf = None
         if not chain:
-            parent_buf = torch.empty(batch + 1, node_stride, dtype=torch.int32, device=_DEVICE)
-            ancestor_buf = torch.empty(batch + 1, node_stride, dtype=torch.int64, device=_DEVICE)
+            parent_buf = torch.empty(batch + 1, num_nodes, dtype=torch.int32, device=_DEVICE)
+            ancestor_buf = torch.empty(batch + 1, num_nodes, num_nodes, dtype=torch.int8, device=_DEVICE)
             uno_tree_structure(next_token, next_sibling, parent_buf, ancestor_buf,
                                num_nodes, max_depth=num_nodes - 1)
             self.assertEqual(parent_buf[:batch, :num_nodes].tolist(), parents.tolist())
@@ -246,7 +246,7 @@ class TestUnoTreeGdn(CustomTestCase):
         # Tree verify from the uncommitted state with the seed folded in.
         parents, next_token, next_sibling = _random_tree(batch, Q, chain=False)
         parent_buf = torch.empty(batch + 1, Q, dtype=torch.int32, device=_DEVICE)
-        anc_buf = torch.empty(batch + 1, Q, dtype=torch.int64, device=_DEVICE)
+        anc_buf = torch.empty(batch + 1, Q, Q, dtype=torch.int8, device=_DEVICE)
         uno_tree_structure(next_token, next_sibling, parent_buf, anc_buf, Q, max_depth=Q - 1)
         xt = torch.randn(batch * Q, dim, device=_DEVICE, dtype=torch.bfloat16)
         at = torch.randn(batch * Q, HV, device=_DEVICE, dtype=torch.bfloat16)
@@ -275,6 +275,9 @@ class TestUnoTreeGdn(CustomTestCase):
 
     def test_tree_q32(self):
         self._case(batch=2, num_nodes=32, chain=False, seed=1)
+
+    def test_tree_q64(self):
+        self._case(batch=2, num_nodes=64, chain=False, seed=4)
 
     def test_chain_draft_f8(self):
         self._case(batch=4, num_nodes=8, chain=True, seed=2)

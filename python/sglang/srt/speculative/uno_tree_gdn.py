@@ -63,8 +63,10 @@ class UnoTreeGdnState:
         # Raw conv input of each request's draft seed (draft row 0).
         self.seed_x = torch.empty((layers, rows, conv.shape[2]), dtype=dtype, device=device)
         # Tree structure of the current verify, built by the first GDN layer.
-        self.parents = torch.empty((rows, node_stride), dtype=torch.int32, device=device)
-        self.ancestors = torch.empty((rows, node_stride), dtype=torch.int64, device=device)
+        self.parents = torch.empty((rows, tree_nodes), dtype=torch.int32, device=device)
+        self.ancestors = torch.empty(
+            (rows, tree_nodes, tree_nodes), dtype=torch.int8, device=device
+        )
 
 
 def enable_uno_tree_gdn(

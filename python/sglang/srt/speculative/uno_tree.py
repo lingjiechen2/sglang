@@ -487,10 +487,10 @@ def build_uno_tree_proposal(
             f"candidate_top_k ({candidate_top_k}) exceeds vocabulary size "
             f"({vocab_size})"
         )
-    if max_nodes > 128 or max_nodes * candidate_top_k > 2048:
+    if max_nodes > 128 or max_nodes * candidate_top_k > 4096:
         raise ValueError(
             "the initial single-program UNO builder requires Q <= 128 and "
-            f"Q*K <= 2048; got Q={max_nodes}, K={candidate_top_k}"
+            f"Q*K <= 4096; got Q={max_nodes}, K={candidate_top_k}"
         )
     capacity = _candidate_tree_capacity(
         num_depths,

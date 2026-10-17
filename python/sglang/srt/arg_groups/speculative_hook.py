@@ -511,9 +511,9 @@ def _handle_uno(server_args: ServerArgs) -> None:
                 f"got Q={verify_width}."
             )
         frontier_slots = verify_width * candidate_top_k
-        if frontier_slots > 2048:
+        if frontier_slots > 4096:
             raise ValueError(
-                "UNO tree mode currently supports Q*K <= 2048; got "
+                "UNO tree mode currently supports Q*K <= 4096; got "
                 f"Q*K={verify_width}*{candidate_top_k}={frontier_slots}."
             )
 

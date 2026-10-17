@@ -33,13 +33,14 @@ def _uno_tree_structure_kernel(
     stride_ns_seq,
     stride_ns_tok,
     parents_out,  # [B, NODE_STRIDE] int32
-    ancestors_out,  # [B, NODE_STRIDE] int64, bit j: node j is an ancestor-or-self
+    ancestors_out,  # [B, ANC_STRIDE] int8, [i * NODE_STRIDE + j]: j is an ancestor-or-self of i
     NUM_NODES: tl.constexpr,
     NP2: tl.constexpr,
     NODE_STRIDE: tl.constexpr,
+    ANC_STRIDE: tl.constexpr,
     MAX_DEPTH: tl.constexpr,
 ):
-    """Parents and ancestor bit masks of one request's tree, once per forward."""
+    """Parents and the ancestor matrix of one request's tree, once per forward."""
     seq = tl.program_id(0).to(tl.int64)
     idx = tl.arange(0, NP2)
     live = idx < NUM_NODES
@@ -58,26 +59,30 @@ def _uno_tree_structure_kernel(
         nxt = tl.sum(tl.where(idx == t, sibling, 0))
         parent_t = tl.sum(tl.where(idx == t, parents, 0))
         parents = tl.where((idx == nxt) & (nxt >= 0), parent_t, parents)
-    one = tl.full((NP2,), 1, tl.int64)
-    bits = tl.where(live, one << idx.to(tl.int64), 0)
+    anc = idx[:, None] == idx[None, :]
     cur = idx
     for _ in tl.static_range(MAX_DEPTH):
         hit = idx[None, :] == cur[:, None]
         cur = tl.where(cur >= 0, tl.sum(tl.where(hit, parents[None, :], 0), axis=1), -1)
-        bits = bits | tl.where(cur >= 0, one << tl.maximum(cur, 0).to(tl.int64), 0)
+        anc = anc | ((idx[None, :] == cur[:, None]) & (cur[:, None] >= 0))
     tl.store(parents_out + seq * NODE_STRIDE + idx, parents, mask=live)
-    tl.store(ancestors_out + seq * NODE_STRIDE + idx, bits, mask=live)
+    tl.store(
+        ancestors_out + seq * ANC_STRIDE + idx[:, None] * NODE_STRIDE + idx[None, :],
+        anc.to(tl.int8),
+        mask=live[:, None] & live[None, :],
+    )
 
 
 def uno_tree_structure(
     next_token: torch.Tensor,  # [B, Q]
     next_sibling: torch.Tensor,
     parents: torch.Tensor,  # [>= B, node_stride] int32 (out)
-    ancestors: torch.Tensor,  # [>= B, node_stride] int64 (out)
+    ancestors: torch.Tensor,  # [>= B, node_stride, node_stride] int8 (out)
     num_nodes: int,
     max_depth: int,
 ) -> None:
-    assert num_nodes <= 63 and parents.stride(0) == ancestors.stride(0)
+    node_stride = parents.stride(0)
+    assert ancestors.stride(1) == node_stride and ancestors.stride(2) == 1
     _uno_tree_structure_kernel[(next_token.shape[0],)](
         next_token,
         next_sibling,
@@ -89,9 +94,10 @@ def uno_tree_structure(
         ancestors,
         NUM_NODES=num_nodes,
         NP2=triton.next_power_of_2(num_nodes),
-        NODE_STRIDE=parents.stride(0),
+        NODE_STRIDE=node_stride,
+        ANC_STRIDE=ancestors.stride(0),
         MAX_DEPTH=max(min(max_depth, num_nodes - 1), 1),
-        num_warps=1,
+        num_warps=1 if num_nodes <= 32 else 4,
     )
 
 
@@ -264,7 +270,7 @@ def _uno_tree_gdn_verify_kernel(
     out,  # [B * Q, HV, V]
     saved_k, saved_v, saved_g, saved_beta,  # [rows * NODE_STRIDE, ...]
     save_rows,  # [B]
-    ancestors,  # [B, ANC_STRIDE] int64 ancestor bits (IS_TREE)
+    ancestors,  # [B, ANC_STRIDE] int8 ancestor matrix, row stride ANC_ROW (IS_TREE)
     scale,
     SAVE_OFFSET: tl.constexpr,
     SEED_NODE: tl.constexpr,
@@ -273,6 +279,7 @@ def _uno_tree_gdn_verify_kernel(
     QP: tl.constexpr,
     NODE_STRIDE: tl.constexpr,
     ANC_STRIDE: tl.constexpr,
+    ANC_ROW: tl.constexpr,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -315,8 +322,11 @@ def _uno_tree_gdn_verify_kernel(
 
     # Ancestor-or-self mask.
     if IS_TREE:
-        bits = tl.load(ancestors + i_b * ANC_STRIDE + o_q, mask=q_ok, other=0)
-        anc = ((bits[:, None] >> o_q[None, :].to(tl.int64)) & 1) != 0
+        anc = tl.load(
+            ancestors + i_b * ANC_STRIDE + o_q[:, None] * ANC_ROW + o_q[None, :],
+            mask=q_ok[:, None] & q_ok[None, :],
+            other=0,
+        ) != 0
     else:
         anc = o_q[None, :] <= o_q[:, None]
     anc = anc & q_ok[:, None] & q_ok[None, :]
@@ -427,7 +437,7 @@ def uno_tree_gdn_verify(
     head_k_dim: int,
     head_v_dim: int,
     scale: Optional[float] = None,
-    ancestors: Optional[torch.Tensor] = None,  # [B, *] int64 bits; None = chain
+    ancestors: Optional[torch.Tensor] = None,  # [B, n, n] int8; None = chain
     max_depth: Optional[int] = None,
     block_v: Optional[int] = None,
     num_warps: Optional[int] = None,
@@ -473,6 +483,7 @@ def uno_tree_gdn_verify(
         QP=qp,
         NODE_STRIDE=node_stride,
         ANC_STRIDE=ancestors.stride(0) if is_tree else 0,
+        ANC_ROW=ancestors.stride(1) if is_tree else 0,
         H=num_k_heads,
         HV=num_v_heads,
         K=head_k_dim,
