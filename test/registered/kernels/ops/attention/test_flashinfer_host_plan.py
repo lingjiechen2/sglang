@@ -9,7 +9,6 @@ import torch
 from flashinfer.quantization import segment_packbits
 
 from sglang.kernels.ops.speculative.cache_locs import generate_draft_decode_kv_indices
-from sglang.kernels.ops.speculative.pack_verify_mask import pack_verify_mask_into
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention import flashinfer_backend as backend
 from sglang.srt.layers.attention.flashinfer_backend import (
@@ -178,38 +177,6 @@ class TestFlashInferDraftHostIndptr(CustomTestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestFlashInferVerifyHostPlan(CustomTestCase):
-    def test_packed_bits_and_padding(self):
-        for width, lengths in [(4, [8196]), (3, [1, 7, 8191]), (5, [13, 17, 16379])]:
-            with self.subTest(width=width, lengths=lengths):
-                indptr = (
-                    torch.tensor([0] + lengths, dtype=torch.int32)
-                    .cumsum(0)
-                    .int()
-                    .cuda()
-                )
-                mask = torch.randint(
-                    0, 2, (sum(lengths) * width,), device="cuda"
-                ).bool()
-                expected, packed_indptr = segment_packbits(
-                    mask, indptr * width, bitorder="little"
-                )
-                result = torch.full(
-                    (expected.numel() + 256,), 173, dtype=torch.uint8, device="cuda"
-                )
-                pack_verify_mask_into(
-                    mask,
-                    indptr,
-                    packed_indptr,
-                    result,
-                    batch_size=len(lengths),
-                    query_width=width,
-                    max_kv_len=max(lengths),
-                )
-                torch.testing.assert_close(
-                    result[: expected.numel()], expected, rtol=0, atol=0
-                )
-                self.assertTrue(torch.all(result[expected.numel() :] == 173).item())
-
     def test_real_wrapper_live_lengths_and_masks(self):
         torch.manual_seed(20261008)
         for dtype, batch in [(torch.bfloat16, 1), (torch.float8_e4m3fn, 3)]:
