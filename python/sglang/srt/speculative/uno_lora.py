@@ -63,6 +63,10 @@ def init_uno_lora_manager(
     manager.fetch_new_loras({None, uno_ref.lora_id})
     if get_spec().uno_fused_lora:
         _fold_uno_lora(manager, uno_ref.lora_id)
+    if get_spec().uno_mova_lora:
+        from sglang.srt.speculative.uno_mova_lora import attach_uno_mova_lora
+
+        attach_uno_mova_lora(manager, model_runner.model, lora_path)
 
     return manager, uno_ref.lora_id
 

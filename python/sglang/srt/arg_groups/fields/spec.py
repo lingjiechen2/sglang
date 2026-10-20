@@ -47,6 +47,15 @@ class Spec(msgspec.Struct):
         "fused kernel per layer, instead of separate LoRA GEMMs. Changes only "
         "how draft forwards execute; base-only forwards are unchanged.",
     ] = False
+    uno_mova_lora: A[
+        bool,
+        "Apply the MoVA LoRA parts shipped next to the UNO LoRA "
+        "(mova/lora.safetensors: q/k/v, dense and shared-expert MLP, and the "
+        "value-expert LoRA shared by all routed value experts) on UNO draft rows. "
+        "The regular LoRA manager cannot run these on K2 Horizon MoVA. Startup "
+        "fails if the file is missing or the model has no MoVA attention. "
+        "Base-only forwards are unchanged.",
+    ] = False
     speculative_draft_model_path: A[
         Optional[str],
         Arg(
