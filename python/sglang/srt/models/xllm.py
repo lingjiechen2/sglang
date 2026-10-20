@@ -1392,6 +1392,8 @@ class XllmMoVAAttention(_XllmMoVAAttentionBase):
             self.total_num_kv_heads * self.head_dim,
             parallel_group="attn_tp",
         )
+        # Set only by UNO's --uno-mova-lora (see speculative/uno_mova_lora.py).
+        self.uno_value_lora = None
 
     def _project_value(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Router bias is deliberately omitted from the logits matmul. It only
@@ -1409,7 +1411,16 @@ class XllmMoVAAttention(_XllmMoVAAttentionBase):
             scaling_factor=self.router_scaling_factor,
             renormalize=self.renormalize,
         )
-        return self.v_experts(hidden_states, routing_weights, selected_values)
+        values = self.v_experts(hidden_states, routing_weights, selected_values)
+        if self.uno_value_lora is not None:  # set only by --uno-mova-lora
+            values = self.uno_value_lora(
+                hidden_states,
+                routing_weights,
+                selected_values,
+                self.v_experts.weight,
+                values,
+            )
+        return values
 
 
 class XllmDecoderLayer(nn.Module):
