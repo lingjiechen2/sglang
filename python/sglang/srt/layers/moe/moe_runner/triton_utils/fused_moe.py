@@ -572,7 +572,9 @@ def _fused_moe_kernel_sequence(
     num_tokens = hidden_states.shape[0]
     E, N, _ = w1.shape
     topk = topk_ids.shape[1]
-    compute_type = tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
+    compute_type = {torch.bfloat16: tl.bfloat16, torch.float32: tl.float32}.get(
+        hidden_states.dtype, tl.float16
+    )
 
     # LoRA hooks consume and update route-major intermediate buffers. The TMA
     # down path keeps those buffers in expert-sorted, block-padded order, which
