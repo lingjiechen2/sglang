@@ -193,7 +193,8 @@ def attach_uno_mova_lora(manager: LoRAManager, model: torch.nn.Module, lora_path
     for (layer, name), ab in sorted(found.items()):
         decoder = layers[layer]
         param = next(decoder.parameters())
-        a, b = (ab[k].to(device=param.device, dtype=param.dtype) for k in "AB")
+        # The manager's device, not the layer's: --cpu-offload-gb keeps offloaded layer weights on the CPU.
+        a, b = (ab[k].to(device=manager.device, dtype=param.dtype) for k in "AB")
         if a.shape[0] != config["r"] or b.shape[1] != config["r"]:
             raise ValueError(f"Layer {layer} {name}: LoRA shapes {tuple(a.shape)}/{tuple(b.shape)} vs rank {config['r']}.")
         if name == "self_attn.v_experts":
