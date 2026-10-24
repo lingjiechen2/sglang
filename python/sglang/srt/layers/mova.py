@@ -206,6 +206,32 @@ def _routed_linear_cuda_chunk(
     return (projected * routing_weights.to(projected).unsqueeze(-1)).sum(dim=1)
 
 
+def _routed_linear_fp32(
+    hidden_states: torch.Tensor,
+    expert_weights: torch.Tensor,
+    routing_weights: torch.Tensor,
+    selected_experts: torch.Tensor,
+) -> torch.Tensor:
+    """fp32 models: every expert's projection by one GEMM, then the routed ones.
+
+    The fused kernel is fp16/bf16 only and the reference materializes the
+    selected weights per token, which is too large for long prefills.
+    """
+    num_experts, width, hidden = expert_weights.shape
+    flat = expert_weights.reshape(num_experts * width, hidden)
+    chunk = max(1, (1 << 28) // (num_experts * width))  # ~1 GiB of fp32 projections
+    outputs = []
+    for begin in range(0, hidden_states.shape[0], chunk):
+        end = min(begin + chunk, hidden_states.shape[0])
+        projected = F.linear(hidden_states[begin:end], flat).view(-1, num_experts, width)
+        index = selected_experts[begin:end].long()[:, :, None].expand(-1, -1, width)
+        projected = F.silu(projected.gather(1, index))
+        outputs.append((projected * routing_weights[begin:end].to(projected)[:, :, None]).sum(1))
+    if not outputs:
+        return hidden_states.new_empty((0, width))
+    return torch.cat(outputs)
+
+
 def routed_linear(
     hidden_states: torch.Tensor,
     expert_weights: torch.Tensor,
@@ -216,6 +242,10 @@ def routed_linear(
 
     if not hidden_states.is_cuda:
         return routed_linear_reference(
+            hidden_states, expert_weights, routing_weights, selected_experts
+        )
+    if hidden_states.dtype == torch.float32:
+        return _routed_linear_fp32(
             hidden_states, expert_weights, routing_weights, selected_experts
         )
     if hidden_states.dtype not in (torch.float16, torch.bfloat16):

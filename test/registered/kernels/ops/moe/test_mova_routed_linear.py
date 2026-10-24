@@ -51,6 +51,27 @@ def test_mova_routed_linear_matches_reference_implementation():
     torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=2e-2)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
+def test_mova_routed_linear_fp32_matches_reference_implementation():
+    """fp32 models take the all-experts GEMM path (the fused kernel is fp16/bf16 only)."""
+
+    torch.manual_seed(0)
+    num_tokens, num_experts, input_size, output_size, top_k = 9, 6, 64, 48, 3
+    hidden_states = torch.randn(num_tokens, input_size, device="cuda")
+    expert_weights = torch.randn(num_experts, output_size, input_size, device="cuda") * input_size**-0.5
+    selected_experts = torch.stack(
+        [torch.randperm(num_experts, device="cuda")[:top_k] for _ in range(num_tokens)]
+    ).to(torch.int32)
+    routing_weights = torch.rand(num_tokens, top_k, device="cuda")
+
+    with get_context().override_server_args():
+        actual = routed_linear(hidden_states, expert_weights, routing_weights, selected_experts)
+    expected = routed_linear_reference(hidden_states, expert_weights, routing_weights, selected_experts)
+
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+
 if __name__ == "__main__":
     import sys
 
