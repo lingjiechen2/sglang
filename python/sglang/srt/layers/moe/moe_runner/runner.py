@@ -60,6 +60,9 @@ class MoeRunner:
         self.runner_backend = runner_backend
         self.config = config
         self.lora_enabled = lora_enabled
+        # Set only by UNO's --uno-mova-lora (see speculative/uno_mova_lora.py):
+        # hidden_states -> LoRAHooks for UNO draft forwards, else None.
+        self.uno_lora_hooks = None
 
         if config.silu_mul_keep_fp32 and not runner_backend.is_deep_gemm():
             raise ValueError(
@@ -195,7 +198,10 @@ class MoeRunner:
     def run(
         self, dispatch_output: DispatchOutput, quant_info: MoeQuantInfo, lora_info=None
     ) -> CombineInput:
-        if self.fused_func is not None and not self.lora_enabled:
+        uno_hooks = None
+        if self.uno_lora_hooks is not None:
+            uno_hooks = self.uno_lora_hooks(dispatch_output.hidden_states)
+        if self.fused_func is not None and not self.lora_enabled and uno_hooks is None:
             return self.fused_func(dispatch_output, quant_info, self.config)
 
         assert self.runner_core is not None
@@ -207,6 +213,8 @@ class MoeRunner:
             # for the Triton runner, so every other backend (deep_gemm,
             # triton_kernels, aiter, ascend, ...) gets here with LoRA disabled
             # and its runner input carries no topk_ids to read.
+            if uno_hooks is not None:
+                return uno_hooks
             if not self.lora_enabled or lora_info is None:
                 return None
 

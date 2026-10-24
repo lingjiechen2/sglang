@@ -11,7 +11,11 @@ only (the seed row and every base-only forward are untouched):
   * ``q_proj`` / ``k_proj`` / ``v_proj`` and the dense / shared-expert MLP
     projections: added to the layer output by a forward hook;
   * ``v_experts``: one LoRA shared by all routed value experts, added to each
-    selected expert's projection *before* the value SiLU.
+    selected expert's projection *before* the value SiLU;
+  * ``mlp.experts.{gate,up,down}_proj``: one LoRA per projection shared by all
+    routed FFN experts, added inside the Triton MoE between its two GEMMs (the
+    MoE runner's LoRA hooks): gate/up deltas to every selected expert's
+    pre-activation, the down delta to every selected expert's weighted output.
 
 Enabled with ``--uno-mova-lora``. The draft rows are the ones UNO's LoRA manager
 routes to the adapter (``uno_single_adapter_route``).
@@ -24,6 +28,7 @@ import logging
 import os
 import re
 from collections import defaultdict
+from functools import partial
 from typing import TYPE_CHECKING
 
 import torch
@@ -40,6 +45,7 @@ MOVA_LORA_FILE = "mova/lora.safetensors"
 _KEY = re.compile(r"model\.layers\.(\d+)\.(.+)\.lora_([AB])\.weight")
 _LINEAR = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "mlp.down_proj", "mlp.shared_experts.down_proj")
 _GATE_UP = ("mlp", "mlp.shared_experts")  # parents whose gate_proj/up_proj are fused into gate_up_proj
+_EXPERTS = ("mlp.experts.gate_proj", "mlp.experts.up_proj", "mlp.experts.down_proj")
 
 
 def draft_rows(lora_backend, num_tokens: int, device) -> torch.Tensor | None:
@@ -82,6 +88,44 @@ class UnoMovaValueLoRA:
         return values
 
 
+class UnoMovaExpertLoRA:
+    """Routed FFN-expert LoRA (one adapter per projection, shared by all experts) on UNO draft rows.
+
+    Called by the MoE runner with the layer input; returns the Triton MoE hooks for
+    a UNO draft forward and None otherwise (the runner then keeps its fused path).
+    """
+
+    def __init__(self, parts, scaling, lora_backend):
+        self.parts = parts  # {"gate_proj" | "up_proj" | "down_proj": (A, B)}
+        self.scaling, self.lora_backend = scaling, lora_backend
+
+    def __call__(self, hidden_states):
+        rows = draft_rows(self.lora_backend, hidden_states.shape[0], hidden_states.device)
+        if rows is None:
+            return None
+        from sglang.srt.lora.lora_moe_runners import LoRAHooks
+
+        return LoRAHooks(after_gate_up=partial(self.after_gate_up, rows), after_down=partial(self.after_down, rows))
+
+    def after_gate_up(self, rows, hidden_states, gate_up, topk_weights, topk_ids):
+        # gate_up: [tokens, topk, 2 * I], gate half first; the delta is the same for every selected expert.
+        width = gate_up.shape[-1] // 2
+        x = hidden_states[rows]
+        for start, proj in ((0, "gate_proj"), (width, "up_proj")):
+            if proj in self.parts:
+                delta = _delta(x, *self.parts[proj], self.scaling).to(gate_up.dtype)
+                gate_up[rows, :, start : start + width] += delta[:, None, :]
+
+    def after_down(self, rows, activated, down, topk_weights, topk_ids):
+        # activated: [tokens * topk, I] route-major; down: [tokens, topk, H], already times the routing weight.
+        if "down_proj" not in self.parts:
+            return
+        tokens, topk, _ = down.shape
+        h = activated[: tokens * topk].view(tokens, topk, -1)[rows]
+        delta = _delta(h, *self.parts["down_proj"], self.scaling) * topk_weights[rows, :, None].to(h.dtype)
+        down[rows] += delta.to(down.dtype)
+
+
 class _RowHook:
     """Forward hook adding LoRA deltas to chosen column slices of a linear layer's output."""
 
@@ -99,6 +143,28 @@ class _RowHook:
         for start, end, a, b in self.parts:
             out[rows, start:end] += _delta(xr, a, b, self.scaling).to(out.dtype)
         return (out, *rest)
+
+
+def _attach_expert_lora(moe, lora: UnoMovaExpertLoRA) -> None:
+    method = moe.quant_method
+    runner = getattr(method, "runner", None)
+    if (
+        runner is None
+        or not runner.runner_backend.is_triton()
+        or getattr(method, "_aiter_runner", None) is not None
+        or getattr(method, "use_flashinfer_cutlass", False)
+        or getattr(method, "use_flashinfer_trtllm_moe", False)
+    ):
+        raise ValueError("--uno-mova-lora with routed FFN-expert LoRA needs --moe-runner-backend triton.")
+    if getattr(method, "w13_swiglu_interleaved", False):
+        raise ValueError("--uno-mova-lora with routed FFN-expert LoRA needs SGLANG_OPT_FUSE_SWIGLU_INTERLEAVED off.")
+    from sglang.srt.runtime_context import get_exec
+
+    if get_exec().moe.enable_fused_moe_sum_all_reduce:
+        raise ValueError("--uno-mova-lora with routed FFN-expert LoRA needs the fused MoE sum all-reduce off.")
+    if moe.moe_tp_size != 1 or moe.moe_ep_size != 1:
+        raise ValueError("--uno-mova-lora supports TP=1 only.")
+    runner.uno_lora_hooks = lora
 
 
 def attach_uno_mova_lora(manager: LoRAManager, model: torch.nn.Module, lora_path: str) -> None:
@@ -122,6 +188,7 @@ def attach_uno_mova_lora(manager: LoRAManager, model: torch.nn.Module, lora_path
 
     backend, layers = manager.lora_backend, model.model.layers
     hooks = defaultdict(list)  # (layer, linear module path) -> [(start, end, A, B)]
+    experts = defaultdict(dict)  # layer -> {projection: (A, B)}
     attached = 0
     for (layer, name), ab in sorted(found.items()):
         decoder = layers[layer]
@@ -134,6 +201,8 @@ def attach_uno_mova_lora(manager: LoRAManager, model: torch.nn.Module, lora_path
             if module.v_experts.output_size_per_partition != module.v_experts.output_size:
                 raise ValueError("--uno-mova-lora supports TP=1 only.")
             module.uno_value_lora = UnoMovaValueLoRA(a, b, scaling, backend)
+        elif name in _EXPERTS:
+            experts[layer][name.rpartition(".")[2]] = (a, b)
         elif name in _LINEAR:
             hooks[(layer, name)].append((0, b.shape[0], a, b))
         else:
@@ -147,4 +216,6 @@ def attach_uno_mova_lora(manager: LoRAManager, model: torch.nn.Module, lora_path
     for (layer, name), parts in hooks.items():
         module = layers[layer].get_submodule(name)
         module.register_forward_hook(_RowHook(parts, scaling, backend))
+    for layer, parts in experts.items():
+        _attach_expert_lora(layers[layer].mlp.experts, UnoMovaExpertLoRA(parts, scaling, backend))
     logger.info("UNO MoVA LoRA: %d adapters on %d layers (scaling %.1f).", attached, len(layers), scaling)
