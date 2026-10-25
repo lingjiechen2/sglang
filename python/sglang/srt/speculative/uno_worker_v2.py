@@ -41,6 +41,7 @@ from sglang.srt.speculative.uno_tree import build_uno_tree_proposal
 from sglang.srt.speculative.uno_tree_gdn import enable_uno_tree_gdn
 from sglang.srt.speculative.uno_utils import (
     build_uno_draft_input,
+    extract_uno_recycle_tail,
     pack_uno_tree_result,
     rectify_uno_greedy_candidates,
     run_uno_sampling,
@@ -130,8 +131,30 @@ class UnoWorkerV2(BaseSpecWorker):
             device=self.device,
         )
         self.rectifier = self._load_rectifier()
+        # Draft recycling keeps each request's unchecked tail in a worker-side buffer
+        # indexed by req_pool_idx (allocated on first use, once the pools exist),
+        # so nothing is relayed through UnoDraftInput or the overlap FutureMap.
+        self.recycle = bool(get_spec().uno_enable_recycle)
+        if self.recycle:
+            if self.tree_mode:
+                raise ValueError("--uno-enable-recycle supports linear UNO only.")
+            if self.forward_width < 3:
+                raise ValueError(
+                    "--uno-enable-recycle needs a block size (speculative_num_draft_tokens) >= 3."
+                )
+        self._recycle_tokens = None
+        self._recycle_lens = None
         # Set once the target pools exist (init_attention_backends).
         self._commits_mamba_state = False
+
+    def _recycle_buffers(self):
+        if self._recycle_tokens is None:
+            slots = int(self.model_runner.req_to_token_pool.req_to_token.shape[0])
+            self._recycle_tokens = torch.zeros(
+                (slots, self.forward_width - 2), dtype=torch.int64, device=self.device
+            )
+            self._recycle_lens = torch.zeros(slots, dtype=torch.int64, device=self.device)
+        return self._recycle_tokens, self._recycle_lens
 
     def _load_rectifier(self) -> Optional[UnoRectifier]:
         if not get_spec().uno_enable_rectifier:
@@ -503,6 +526,8 @@ class UnoWorkerV2(BaseSpecWorker):
             new_seq_lens=batch.seq_lens,
             forward_width=self.forward_width,
         )
+        if self.recycle:  # a (re)started request has no tail yet; slots are reused
+            self._recycle_buffers()[1][batch.req_pool_indices.to(torch.int64)] = 0
 
         if on_publish is not None:
             on_publish(result.new_seq_lens)
@@ -757,10 +782,20 @@ class UnoWorkerV2(BaseSpecWorker):
             logical_positions,
         ].to(torch.int64)
 
+        recycle_slots = None
+        recycle_kwargs = {}
+        if self.recycle:
+            recycle_slots = batch.req_pool_indices.to(torch.int64)
+            tail_tokens, tail_lens = self._recycle_buffers()
+            recycle_kwargs = dict(
+                hint_tokens=tail_tokens[recycle_slots],
+                hint_lens=tail_lens[recycle_slots],
+            )
         draft_input_ids = build_uno_draft_input(
             seed_tokens=seed_tokens,
             forward_width=self.forward_width,
             vocab_size=self.model_runner.model_config.vocab_size,
+            **recycle_kwargs,
         )
         draft_forward_batch = self._make_forward_batch(
             spec_input_type=SpecInputType.UNO_DRAFT,
@@ -848,6 +883,11 @@ class UnoWorkerV2(BaseSpecWorker):
             accept_lens = sampling_result.accept_lens
             new_seq_lens = sampling_result.new_seq_lens
             correction = sampling_result.next_seed_tokens
+
+        if self.recycle:
+            tail, tail_lens = extract_uno_recycle_tail(candidates, accept_lens)
+            self._recycle_tokens[recycle_slots] = tail
+            self._recycle_lens[recycle_slots] = tail_lens
 
         if self._commits_mamba_state:
             # Verify row 0 is the clean root; rows 1..k are the accepted drafts.

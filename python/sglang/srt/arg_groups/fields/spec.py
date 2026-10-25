@@ -41,6 +41,14 @@ class Spec(msgspec.Struct):
         "Startup fails if the files are "
         "missing. Verification stays lossless either way.",
     ] = False
+    uno_enable_recycle: A[
+        bool,
+        "UNO draft recycling (linear mode only, block size >= 3): proposals that "
+        "follow the correction token and were never verified fill the first noise "
+        "slots of the request's next draft forward. Only the draft input changes; "
+        "the draft distribution is still the one sampled from, so verification "
+        "stays lossless. Meant for adapters trained with recycled hints.",
+    ] = False
     uno_fused_lora: A[
         bool,
         "Fold UNO's draft LoRA-A into each base GEMM and apply LoRA-B with one "
