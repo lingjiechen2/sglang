@@ -385,6 +385,8 @@ def build_uno_draft_input(
     forward_width: int,
     vocab_size: int,
     noise_tokens: torch.Tensor | None = None,  # for testing
+    hint_tokens: torch.Tensor | None = None,
+    hint_lens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Build one ``[seed, uniform noise...]`` row per request.
 
@@ -393,6 +395,12 @@ def build_uno_draft_input(
     Supplying ``noise_tokens`` bypasses random generation. This is used
     by deterministic tests and must have shape
     ``(batch_size, forward_width - 1)``.
+
+    Draft recycling: ``hint_tokens`` ``[batch, W]`` and ``hint_lens`` ``[batch]``
+    replace the first ``hint_lens[b]`` noise slots of request ``b`` with the
+    unchecked proposals of the previous cycle. The noise is drawn first either way,
+    so the RNG stream does not depend on the hints. Without hints the result is
+    unchanged.
 
     ``forward_width == 1`` never generates noise or consumes RNG state.
     """
@@ -417,11 +425,47 @@ def build_uno_draft_input(
             dtype=torch.int64,
         )
 
+    if hint_tokens is not None:
+        width = hint_tokens.shape[1]
+        if hint_lens is None or width > forward_width - 1:
+            raise ValueError("UNO recycle hints need hint_lens and fit the noise window.")
+        use_hint = torch.arange(width, device=seed_tokens.device)[None, :] < hint_lens[
+            :, None
+        ].to(seed_tokens.device)
+        noise_tokens = noise_tokens.clone()
+        noise_tokens[:, :width] = torch.where(
+            use_hint,
+            hint_tokens.to(device=seed_tokens.device, dtype=torch.int64),
+            noise_tokens[:, :width],
+        )
+
     draft_input_ids = seed_tokens.new_empty((batch_size, forward_width))
     draft_input_ids[:, 0].copy_(seed_tokens)
     draft_input_ids[:, 1:].copy_(noise_tokens)
 
     return draft_input_ids
+
+
+def extract_uno_recycle_tail(
+    candidates: torch.Tensor,  # [B, F]
+    accept_lens: torch.Tensor,  # [B]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Unchecked proposals after the correction token, for the next cycle's noise window.
+
+    A cycle commits ``accept_lens`` tokens: ``candidates[:, :accept_lens - 1]`` and the
+    correction (the target's token at the first rejected proposal, or the bonus token).
+    ``candidates[:, accept_lens:]`` were never verified and propose the positions that
+    follow the correction, i.e. noise slots 0, 1, ... of the next draft input.
+    Returns ``(tail [B, F - 2], tail_lens [B])``; entries past ``tail_lens`` are zero.
+    """
+    batch_size, forward_width = candidates.shape
+    width = max(forward_width - 2, 0)
+    accept_lens = accept_lens.to(torch.int64)
+    lens = (forward_width - accept_lens).clamp(min=0, max=width)
+    cols = torch.arange(width, device=candidates.device)[None, :]
+    source = (accept_lens[:, None] + cols).clamp(max=forward_width - 1)
+    tail = candidates.gather(1, source) * (cols < lens[:, None])
+    return tail, lens
 
 
 def sample_uno_candidates(
