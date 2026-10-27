@@ -384,6 +384,13 @@ class UnoWorkerV2(BaseSpecWorker):
             capture_hidden_mode=CaptureHiddenMode.NULL,
             return_hidden_states_before_norm=False,
         )
+        if self.model_runner.model_config.model_is_mrope:
+            # mrope models (e.g. Qwen3.5 / Qwen3.8) read forward_batch.mrope_positions
+            # instead of positions. UNO rows are text-only, so every mrope axis
+            # carries the 1-D position (as compute_spec_mrope_positions does for
+            # text-only batches). Without this, eager forwards crash on None and
+            # CUDA-graph replays keep whatever the shared buffer last held.
+            forward_batch.mrope_positions = positions.to(torch.int64).unsqueeze(0).repeat(3, 1)
         self.model_runner.kv_index_translator.bind_own_plan(forward_batch)
         return forward_batch
 
@@ -481,11 +488,30 @@ class UnoWorkerV2(BaseSpecWorker):
 
         return output_ids, accept_lens, new_seq_lens, correction
 
+    def _reset_replayssm_spec_cursors(self, batch: ScheduleBatch) -> None:
+        """Empty the ReplaySSM spec ring of every request in a prefill batch.
+
+        The allocator also zeroes these cursors when a request slot is handed out,
+        but that write is not ordered after the previous owner's last verify
+        commit on the forward stream, which can then leave stale cursors behind.
+        A prefilling request has no ring entries, so resetting here (in stream
+        order, before its prefill) is always safe.
+        """
+        mamba_pool = getattr(self.model_runner.req_to_token_pool, "mamba_pool", None)
+        write_pos = getattr(mamba_pool, "replayssm_spec_write_pos", None)
+        if write_pos is None:
+            return
+        rows = batch.req_pool_indices.to(device=write_pos.device, dtype=torch.int64)
+        write_pos[rows] = 0
+        mamba_pool.replayssm_cache_base[rows] = 0
+        mamba_pool.replayssm_is_flush[rows] = 0
+
     def _forward_prefill(
         self,
         batch: ScheduleBatch,
         on_publish,
     ) -> GenerationBatchResult:
+        self._reset_replayssm_spec_cursors(batch)
         result = self.target_worker.forward_batch_generation(batch)
         if not isinstance(result.next_token_ids, torch.Tensor):
             raise RuntimeError("UNO target prefill returned no sampled seed tensor.")
