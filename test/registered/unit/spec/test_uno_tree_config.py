@@ -24,6 +24,7 @@ class TestUnoTreeConfig(CustomTestCase):
             speculative_num_draft_tokens=8,
             speculative_num_steps=3,
             speculative_eagle_topk=2,
+            uno_draft_weight_quant="none",
         )
 
         with (

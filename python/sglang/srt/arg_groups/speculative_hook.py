@@ -472,6 +472,26 @@ def _handle_uno(server_args: ServerArgs) -> None:
             "integer denoting the linear width or tree verify width Q."
         )
     verify_width = int(verify_width)
+    draft_quant = cfg.uno_draft_weight_quant
+    if draft_quant != "none":
+        topk = 1 if cfg.speculative_eagle_topk is None else int(cfg.speculative_eagle_topk)
+        if topk > 1:
+            raise ValueError("--uno-draft-weight-quant supports linear UNO only.")
+        if draft_quant != "bf16" and not cfg.uno_fused_lora:
+            raise ValueError(
+                "--uno-draft-weight-quant fp8/int4 quantizes the folded draft GEMMs "
+                "and needs --uno-fused-lora."
+            )
+        if cfg.uno_enable_recycle:
+            raise ValueError("--uno-draft-weight-quant does not support --uno-enable-recycle.")
+        if cfg.uno_mova_lora:
+            raise ValueError("--uno-draft-weight-quant does not support --uno-mova-lora.")
+        if verify_width < 2:
+            raise ValueError("--uno-draft-weight-quant needs a block size of at least 2.")
+        # Both passes run the seed row plus the F-token block: F + 1 rows. Count from
+        # the raw input so a repeated resolution does not add the row twice.
+        raw_width = getattr(server_args, "speculative_num_draft_tokens", None)
+        verify_width = (int(raw_width) if raw_width is not None else verify_width) + 1
     declare_resolution(
         server_args,
         "_handle_uno",

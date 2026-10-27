@@ -72,6 +72,17 @@ def _uses_linear_verify_conv(spec_info, window, width: int, retrieve_next_token)
     )
 
 
+def _uno_draft_keeps_conv_state(spec_info) -> bool:
+    """True for UNO draft passes under --uno-draft-weight-quant (seed in verify)."""
+    from sglang.srt.runtime_context import get_spec
+    from sglang.srt.speculative.spec_info import SpecInputType
+
+    return (
+        getattr(spec_info, "spec_input_type", None) == SpecInputType.UNO_DRAFT
+        and get_spec().uno_draft_weight_quant != "none"
+    )
+
+
 def _verify_replayssm_launch(spec_info, batch_size: int, head_k_dim: int) -> dict:
     """UNO ReplaySSM verify launch config; others keep the kernel defaults.
 
@@ -1122,6 +1133,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
             mixed_qkv_reshaped = mixed_qkv.view(
                 batch_size, draft_token_num, -1
             ).transpose(1, 2)
+            # --uno-draft-weight-quant: no commit follows the draft pass (the
+            # verify re-runs the seed row), so the draft must leave conv_state
+            # as committed; only the window is written.
+            keep_conv_state = _uno_draft_keeps_conv_state(forward_batch.spec_info)
+            if keep_conv_state and not linear_verify_conv:
+                raise NotImplementedError(
+                    "--uno-draft-weight-quant needs the dedup linear-verify conv window."
+                )
             if linear_verify_conv:
                 mixed_qkv_processed = causal_conv1d_linear_verify(
                     mixed_qkv_reshaped,
@@ -1132,6 +1151,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     conv_state_indices=cache_indices[:batch_size],
                     intermediate_conv_window=intermediate_conv_window_cache,
                     intermediate_state_indices=intermediate_state_indices[:batch_size],
+                    update_conv_state=not keep_conv_state,
                 )
             else:
                 mixed_qkv_processed = causal_conv1d_update(

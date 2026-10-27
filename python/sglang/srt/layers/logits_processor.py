@@ -298,6 +298,14 @@ class LogitsProcessorOutput:
                     sequences[i] = [row for span in spans for row in span.tolist()]
 
 
+def _is_uno_draft(spec_info) -> bool:
+    if spec_info is None:
+        return False
+    from sglang.srt.speculative.spec_info import SpecInputType
+
+    return getattr(spec_info, "spec_input_type", None) == SpecInputType.UNO_DRAFT
+
+
 @dataclasses.dataclass
 class LogitsMetadata:
     forward_mode: ForwardMode
@@ -341,6 +349,10 @@ class LogitsMetadata:
     attn_tp_sequence_sharded: bool = False
 
     mm_input_embeds: Optional[torch.Tensor] = None
+
+    # UNO draft forward: lm_head may read the draft-only quantized copy
+    # (--uno-draft-weight-quant; see speculative/uno_draft_quant.py).
+    uno_draft: bool = False
 
     # DRAFT_EXTEND_V2: when set, lm_head and LAST hidden capture use only these
     # rows (see EagleDraftExtendInput.select_index).
@@ -408,6 +420,7 @@ class LogitsMetadata:
             dp_padding_mode=DpPaddingMode.SUM_LEN,
             mm_input_embeds=forward_batch.mm_input_embeds,
             draft_extend_select_index=draft_extend_select_index,
+            uno_draft=_is_uno_draft(forward_batch.spec_info),
         )
 
     def compute_dp_attention_metadata(self):
@@ -906,7 +919,16 @@ class LogitsProcessor(nn.Module):
             else LoRABatchLayout.DP_LOCAL
         )
         with get_forward().scoped(lora_batch_layout=lora_batch_layout):
-            logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
+            draft_lm_head = getattr(lm_head, "uno_draft_weight", None)
+            if (
+                logits_metadata.uno_draft
+                and draft_lm_head is not None
+                and embedding_bias is None
+                and hidden_states.shape[0] <= draft_lm_head.max_rows
+            ):
+                logits = draft_lm_head(hidden_states)
+            else:
+                logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
         _trace_e2e_logits("lm_head_returned", logits_shape=tuple(logits.shape))
         if envs.SGLANG_TRACE_LOGITS_E2E_SYNC.get():
             _trace_e2e_logits("post_lm_head_sync_enter")
