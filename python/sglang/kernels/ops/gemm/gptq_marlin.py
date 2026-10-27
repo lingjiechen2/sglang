@@ -26,6 +26,22 @@ def _jit_gptq_marlin_module(dtype: torch.dtype) -> Module:
     )
 
 
+@cache_once
+def _jit_gptq_marlin_cfg_module(dtype: torch.dtype, pipe_stages: int) -> Module:
+    args = make_cpp_args(dtype, pipe_stages)
+    dtype_args = make_cpp_args(dtype)
+    return load_jit(
+        "gptq_marlin_cfg",
+        *args,
+        cuda_files=["gemm/marlin/gptq_marlin.cuh"],
+        cuda_wrappers=[("gptq_marlin_gemm_cfg", f"gptq_marlin_gemm_cfg<{dtype_args}>")],
+        extra_cuda_cflags=[
+            f"-DSGL_MARLIN_PIPE_STAGES={pipe_stages}",
+            "-DSGL_MARLIN_SMALL_M_TILES",
+        ],
+    )
+
+
 def _or_empty(
     t: Optional[torch.Tensor], device: torch.device, dtype: torch.dtype
 ) -> torch.Tensor:
@@ -114,4 +130,68 @@ def gptq_marlin_gemm(
         is_zp_float,
     )
 
+    return c
+
+
+def gptq_marlin_gemm_cfg(
+    a: torch.Tensor,
+    b_q_weight: torch.Tensor,
+    b_scales: torch.Tensor,
+    workspace: torch.Tensor,
+    b_q_type: ScalarType,
+    size_n: int,
+    size_k: int,
+    *,
+    thread_k: int,
+    thread_n: int,
+    num_threads: int,
+    blocks_per_sm: int,
+    pipe_stages: int = 4,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Marlin GEMM of uint4b8 weights with an explicit launch config (no zero
+    points, act order or global scale; full K; fp32 reduce). ``thread_k = -1``
+    keeps the default thread tile and one block per SM.
+
+    ``workspace`` must hold one zeroed lock per thread block
+    (``SMs * blocks_per_sm``). Each ``pipe_stages`` value is its own JIT module.
+    """
+    device = a.device
+    size_m = a.size(0)
+    c = out if out is not None else torch.empty((size_m, size_n), dtype=a.dtype, device=device)
+    if size_m == 0:
+        return c
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    max_m_block = min(((size_m + 15) // 16) * 16, 64)
+    # fp32 partial tile per thread block.
+    c_tmp = torch.empty(
+        sms * blocks_per_sm * max_m_block * max(thread_n, _MAX_THREAD_N),
+        dtype=torch.float32,
+        device=device,
+    )
+    empty = torch.empty(0, dtype=a.dtype, device=device)
+    empty_i = torch.empty(0, dtype=torch.int32, device=device)
+    module = _jit_gptq_marlin_cfg_module(a.dtype, pipe_stages)
+    module.gptq_marlin_gemm_cfg(
+        a,
+        b_q_weight,
+        b_scales,
+        empty,
+        empty_i,
+        empty_i,
+        empty_i,
+        c,
+        c_tmp,
+        empty,
+        workspace,
+        b_q_type.id,
+        True,
+        False,
+        True,
+        False,
+        thread_k,
+        thread_n,
+        num_threads,
+        blocks_per_sm,
+    )
     return c

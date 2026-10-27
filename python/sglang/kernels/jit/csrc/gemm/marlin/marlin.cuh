@@ -14,7 +14,12 @@ namespace device::marlin {
 // we want relatively few warps to have many registers per warp and small tiles.
 static constexpr int default_threads = 256;
 
-static constexpr int pipe_stages = 4;  // 4 pipeline stages fit into shared memory
+// 4 pipeline stages fit into shared memory. A separately built module may
+// override the count (e.g. deeper pipelines for small-M weight-streaming GEMMs).
+#ifndef SGL_MARLIN_PIPE_STAGES
+#define SGL_MARLIN_PIPE_STAGES 4
+#endif
+static constexpr int pipe_stages = SGL_MARLIN_PIPE_STAGES;
 
 static constexpr int min_thread_n = 64;
 static constexpr int min_thread_k = 64;
