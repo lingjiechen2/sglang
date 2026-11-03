@@ -97,6 +97,9 @@ def _rectified_chain_kernel(
             )
             probs = tl.where(keep & (probs >= cutoff), probs, 0.0)
             probs = probs / tl.sum(probs, axis=0)
+            # Triton's fp32 division is approximate: a one-token nucleus can come out as
+            # 1 + 1 ulp, which the chain verifier's q <= 1 guard treats as invalid and rejects.
+            probs = tl.minimum(probs, 1.0)
             tl.store(draft_probs + row + offsets, probs, mask=in_bounds)
             # Gumbel-max on log q samples exactly the published q.
             uniform = tl.load(uniforms + row + offsets, mask=in_bounds, other=0.5)
