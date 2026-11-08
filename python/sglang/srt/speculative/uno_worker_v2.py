@@ -21,6 +21,7 @@ from sglang.srt.model_executor.forward_context import (
 )
 from sglang.srt.runtime_context import (
     get_exec,
+    get_parallel,
     get_schedule,
     get_spec,
     mamba_track_grid,
@@ -348,6 +349,13 @@ class UnoWorkerV2(BaseSpecWorker):
         if name == "_target_worker":
             raise AttributeError(name)
         return getattr(self.target_worker, name)
+
+    def _sync_tp(self, *tensors: torch.Tensor) -> None:
+        """Sampling draws per-rank random numbers: every TP rank adopts rank 0's result."""
+        group = get_parallel().tp_group
+        if group.world_size > 1:
+            for tensor in tensors:
+                group.broadcast(tensor, src=0)
 
     def _validate_batch(self, batch: ScheduleBatch) -> None:
         if batch.forward_mode.is_idle():
@@ -679,6 +687,7 @@ class UnoWorkerV2(BaseSpecWorker):
                 uniform_top_k_value=draft_state.uniform_top_k_value,
             )
 
+        self._sync_tp(clean_root_tokens)
         rectified_children = None
         if self.rectifier is not None and self.forward_width > 1:
             # Each tree node's children are rectified on the node's own token.
@@ -893,6 +902,7 @@ class UnoWorkerV2(BaseSpecWorker):
                 uniform_top_k_value=uniform_top_k_value,
                 rectifier=self.rectifier,
             )
+            self._sync_tp(candidates)
         elif self.rectifier is not None:
             candidates = rectify_uno_greedy_candidates(
                 candidates=candidates,
@@ -940,6 +950,7 @@ class UnoWorkerV2(BaseSpecWorker):
             accept_lens = sampling_result.accept_lens
             new_seq_lens = sampling_result.new_seq_lens
             correction = sampling_result.next_seed_tokens
+            self._sync_tp(output_ids, accept_lens, new_seq_lens, correction)
 
         if self.recycle:
             tail, tail_lens = extract_uno_recycle_tail(candidates, accept_lens)
