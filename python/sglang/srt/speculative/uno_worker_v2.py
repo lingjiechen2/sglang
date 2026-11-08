@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import logging
+import os
 import time
 from typing import TYPE_CHECKING, Optional
 
@@ -118,6 +119,15 @@ class UnoWorkerV2(BaseSpecWorker):
         # init_attention_backends(), after those pools exist.
         self._uno_draft_attn_backend = None
         self._uno_draft_cuda_graph_runner = None
+        # Draft-only KV window in tokens (opt-in env UNO_DRAFT_KV_WINDOW, 0 = off = unchanged behaviour). Linear UNO
+        # runs draft and verify on the same backend, so the window is switched on only around the draft pass and
+        # needs eager execution (see init_cuda_graphs); tree UNO sets it once on its private draft backend.
+        self._uno_draft_window = int(os.environ.get("UNO_DRAFT_KV_WINDOW", "0"))
+        # Optional layer selection (UNO_DRAFT_KV_WINDOW_LAYERS="0,2,4-34", 0-based): only these layers get the
+        # window; unset/empty = every layer.
+        self._uno_draft_window_layers = self._parse_layer_ids(
+            os.environ.get("UNO_DRAFT_KV_WINDOW_LAYERS", "")
+        )
         self.plan_stream, self.plan_stream_ctx = (
             get_plan_stream(self.device)
             if self.tree_mode
@@ -169,6 +179,15 @@ class UnoWorkerV2(BaseSpecWorker):
 
         if self.tree_mode:
             self._uno_draft_attn_backend = self._build_uno_draft_attn_backend()
+            if self._uno_draft_window > 0:
+                # The private tree-draft backend never runs the verify pass, so the window can stay on.
+                private = self._uno_draft_attn_backend
+                full = getattr(private, "full_attn_backend", private)
+                if not hasattr(full, "uno_draft_window"):
+                    raise RuntimeError("UNO_DRAFT_KV_WINDOW needs the FlashAttention backend.")
+                self._configure_draft_window_backend(full)
+                full.uno_draft_window = self._uno_draft_window
+                logger.info("UNO draft KV window: %d tokens (tree draft backend).", self._uno_draft_window)
         # Linear-attention layers keep a recurrent state that TARGET_VERIFY
         # never advances; UNO commits it after each of its two passes.
         self._commits_mamba_state = (
@@ -220,6 +239,16 @@ class UnoWorkerV2(BaseSpecWorker):
         """Capture only the private F-wide tree-draft graph."""
 
         self._uno_draft_cuda_graph_runner = None
+        if (
+            self._uno_draft_window > 0
+            and not self.tree_mode
+            and self.model_runner.decode_cuda_graph_runner is not None
+        ):
+            # Linear UNO replays one captured graph for both the draft and the verify pass; a window baked into
+            # it would also cut the verify context and silently break losslessness.
+            raise RuntimeError(
+                "UNO_DRAFT_KV_WINDOW with linear UNO needs eager decoding: start the server with --disable-cuda-graph."
+            )
         if not self.tree_mode or self.model_runner.decode_cuda_graph_runner is None:
             return None
         if self._uno_draft_attn_backend is None:
@@ -935,6 +964,56 @@ class UnoWorkerV2(BaseSpecWorker):
             self.model_runner.attn_backend = target_attn_backend
             self.model_runner.decode_cuda_graph_runner = target_graph_runner
 
+    @staticmethod
+    def _parse_layer_ids(spec: str):
+        """Parse "0,2,4-6" into a frozenset of layer ids; empty -> None (all layers)."""
+
+        spec = spec.strip()
+        if not spec:
+            return None
+        ids = set()
+        for item in spec.split(","):
+            item = item.strip()
+            if not item:
+                raise ValueError(f"Empty entry in UNO_DRAFT_KV_WINDOW_LAYERS={spec!r}")
+            if "-" in item:
+                low, high = (int(part) for part in item.split("-"))
+                if low > high:
+                    raise ValueError(f"Descending range {item!r} in UNO_DRAFT_KV_WINDOW_LAYERS")
+                ids.update(range(low, high + 1))
+            else:
+                ids.add(int(item))
+        return frozenset(ids)
+
+    def _configure_draft_window_backend(self, full) -> None:
+        """Validate the layer selection against the model and hand it to the attention backend."""
+
+        layers = self._uno_draft_window_layers
+        if layers is not None:
+            num_layers = int(self.model_runner.model_config.hf_config.num_hidden_layers)
+            bad = sorted(i for i in layers if not 0 <= i < num_layers)
+            if bad:
+                raise ValueError(f"UNO_DRAFT_KV_WINDOW_LAYERS has ids {bad} outside [0, {num_layers}).")
+        full.uno_draft_window_layers = layers
+
+    @contextlib.contextmanager
+    def _linear_draft_window_context(self):
+        """Linear UNO: read only the recent keys during the draft pass, never during the verify pass."""
+
+        if self._uno_draft_window <= 0 or self.tree_mode:
+            yield
+            return
+        backend = self.model_runner.attn_backend
+        full = getattr(backend, "full_attn_backend", backend)
+        if not hasattr(full, "uno_draft_window"):
+            raise RuntimeError("UNO_DRAFT_KV_WINDOW needs the FlashAttention backend.")
+        self._configure_draft_window_backend(full)
+        full.uno_draft_window = self._uno_draft_window
+        try:
+            yield
+        finally:
+            full.uno_draft_window = -1
+
     def _run_draft_block(
         self,
         forward_batch: ForwardBatch,
@@ -956,7 +1035,7 @@ class UnoWorkerV2(BaseSpecWorker):
         # The eager runner plans through model_runner.attn_backend, while
         # attention layers execute through ForwardContext. Tree UNO binds both
         # to the same private F/1 backend for this draft pass.
-        with backend_context, attn_context:
+        with backend_context, attn_context, self._linear_draft_window_context():
             if self.num_speculative_proposals == 0:
                 return self._run_target_block(
                     forward_batch,
