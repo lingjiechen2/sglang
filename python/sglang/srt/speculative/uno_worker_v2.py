@@ -929,6 +929,7 @@ class UnoWorkerV2(BaseSpecWorker):
                 ),
                 rectifier=self.rectifier,
             )
+            self._sync_tp(candidates=candidates)
 
         verify_prefix_lens = committed_seq_lens + 1
         verify_forward_batch = self._make_forward_batch(

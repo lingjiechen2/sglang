@@ -573,8 +573,8 @@ def _handle_uno(server_args: ServerArgs) -> None:
 
     if cfg.pp_size != 1:
         raise ValueError("UNO requires PP=1.")
-    if cfg.tp_size > 1 and (cfg.uno_fused_lora or cfg.uno_enable_rectifier):
-        raise ValueError("--uno-fused-lora and --uno-enable-rectifier need TP=1 for now.")
+    if cfg.tp_size > 1 and cfg.uno_fused_lora:
+        raise ValueError("--uno-fused-lora needs TP=1 for now.")
     if attn_dp_enabled_of(cfg) or cfg.attn_cp_size != 1:
         raise ValueError("UNO does not support DP attention or context parallelism.")
     if cfg.enable_lora or cfg.lora_paths:
