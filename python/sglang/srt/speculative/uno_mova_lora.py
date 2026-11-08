@@ -13,9 +13,11 @@ only (the seed row and every base-only forward are untouched):
   * ``v_experts``: one LoRA shared by all routed value experts, added to each
     selected expert's projection *before* the value SiLU;
   * ``mlp.experts.{gate,up,down}_proj``: one LoRA per projection shared by all
-    routed FFN experts, added inside the Triton MoE between its two GEMMs (the
-    MoE runner's LoRA hooks): gate/up deltas to every selected expert's
-    pre-activation, the down delta to every selected expert's weighted output.
+    routed FFN experts (2-D A/B), or one LoRA per expert (3-D A [E, r, in] /
+    B [E, out, r], ``lora_expert_mode=per_expert``), added inside the Triton MoE
+    between its two GEMMs (the MoE runner's LoRA hooks): gate/up deltas to every
+    selected expert's pre-activation, the down delta to every selected expert's
+    weighted output. A per-expert adapter applies each slot's own expert adapter.
 
 Enabled with ``--uno-mova-lora``. The draft rows are the ones UNO's LoRA manager
 routes to the adapter (``uno_single_adapter_route``).
@@ -88,6 +90,38 @@ class UnoMovaValueLoRA:
         return values
 
 
+class UnoMovaPerExpertValueLoRA:
+    """Per-expert value LoRA (``lora_expert_mode=per_expert``): every routed value expert has its own adapter.
+
+    ``a`` is [E, r, in] and ``b`` is [E, out, r] (out = the value width of one expert). Same placement as
+    :class:`UnoMovaValueLoRA`: the delta of each *selected* expert is added to that expert's projection before the
+    value SiLU. All experts' rank activations come from one GEMM, ``b`` is applied per expert with a batched matmul,
+    then the selected experts' deltas are gathered, the same all-experts-then-gather scheme as the base projection.
+    """
+
+    def __init__(self, a, b, scaling, lora_backend):
+        self.rank = a.shape[1]
+        self.a_flat = a.reshape(-1, a.shape[-1]).contiguous()  # [E * r, in]
+        self.b_t = b.transpose(1, 2).contiguous()  # [E, r, out]
+        self.scaling, self.lora_backend = scaling, lora_backend
+
+    def __call__(self, hidden_states, routing_weights, selected_experts, expert_weights, values):
+        rows = draft_rows(self.lora_backend, hidden_states.shape[0], hidden_states.device)
+        if rows is None:
+            return values
+        x = hidden_states[rows]
+        num_experts, width, hidden = expert_weights.shape
+        projected = F.linear(x, expert_weights.reshape(num_experts * width, hidden)).view(-1, num_experts, width)
+        index = selected_experts[rows].long()[:, :, None].expand(-1, -1, width)
+        activation = F.linear(x, self.a_flat).view(-1, num_experts, self.rank).transpose(0, 1)  # [E, R, r]
+        delta = torch.bmm(activation, self.b_t).transpose(0, 1)  # [R, E, out]
+        projected = projected.gather(1, index) + delta.gather(1, index) * self.scaling
+        mixed = (F.silu(projected) * routing_weights[rows].to(projected.dtype)[:, :, None]).sum(1)
+        values = values.clone()
+        values[rows] = mixed.to(values.dtype)
+        return values
+
+
 class UnoMovaExpertLoRA:
     """Routed FFN-expert LoRA (one adapter per projection, shared by all experts) on UNO draft rows.
 
@@ -123,6 +157,72 @@ class UnoMovaExpertLoRA:
         tokens, topk, _ = down.shape
         h = activated[: tokens * topk].view(tokens, topk, -1)[rows]
         delta = _delta(h, *self.parts["down_proj"], self.scaling) * topk_weights[rows, :, None].to(h.dtype)
+        down[rows] += delta.to(down.dtype)
+
+
+def _expert_lora_loop(x: torch.Tensor, expert_ids: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Per-slot ``B[e] (A[e] x)`` without scaling: one matmul pair per expert that owns slots (reference / fallback)."""
+    out = x.new_zeros(x.shape[0], b.shape[1])
+    for e in torch.unique(expert_ids).tolist():
+        idx = (expert_ids == e).nonzero(as_tuple=True)[0]
+        out[idx] = F.linear(F.linear(x[idx], a[e]), b[e])
+    return out
+
+
+def _expert_lora_grouped(x: torch.Tensor, expert_ids: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Same as :func:`_expert_lora_loop`, with the slots sorted by expert and two ``torch._grouped_mm`` calls.
+
+    Host-sync free (argsort, scatter_add_, cumsum, grouped_mm with device-side offsets, advanced-index copies), hence safe
+    inside CUDA graph capture and replay."""
+    num_experts = a.shape[0]
+    order = torch.argsort(expert_ids, stable=True)
+    # Counts per expert without a host sync (torch.bincount on CUDA reads the output size back), so the hooks can run
+    # inside a CUDA graph capture.
+    counts = torch.zeros(num_experts, dtype=torch.int64, device=expert_ids.device)
+    counts.scatter_add_(0, expert_ids, torch.ones_like(expert_ids))
+    offsets = torch.cumsum(counts, 0).to(torch.int32)
+    rank_act = torch._grouped_mm(x[order], a.transpose(1, 2), offs=offsets)  # [S, r]
+    delta = torch._grouped_mm(rank_act, b.transpose(1, 2), offs=offsets)  # [S, out]
+    out = torch.empty_like(delta)
+    out[order] = delta
+    return out
+
+
+def expert_lora(x: torch.Tensor, expert_ids: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """``B[e_s] (A[e_s] x_s)`` for every slot ``s``; ``a`` [E, r, in], ``b`` [E, out, r], ``expert_ids`` [S] int."""
+    if x.is_cuda and x.dtype in (torch.bfloat16, torch.float16) and hasattr(torch, "_grouped_mm"):
+        return _expert_lora_grouped(x, expert_ids.long(), a, b)
+    return _expert_lora_loop(x, expert_ids.long(), a, b)
+
+
+class UnoMovaPerExpertExpertLoRA(UnoMovaExpertLoRA):
+    """Routed FFN-expert LoRA with one adapter per expert (``lora_expert_mode=per_expert``) on UNO draft rows.
+
+    ``parts`` maps each projection to ``(A [E, r, in], B [E, out, r])``; expert ``e`` of the adapter is expert ``e`` of
+    the model's routed experts (TP=1, so the Triton MoE's ``topk_ids`` are the global expert ids). Placement as in
+    :class:`UnoMovaExpertLoRA`: the gate/up deltas of each *selected* expert go to its pre-activation, and the down
+    delta (computed on the already LoRA-modified activation) to its output times the routing weight.
+    """
+
+    def after_gate_up(self, rows, hidden_states, gate_up, topk_weights, topk_ids):
+        width = gate_up.shape[-1] // 2
+        topk = topk_ids.shape[1]
+        x = hidden_states[rows].repeat_interleave(topk, dim=0)  # [R * topk, H], slot (row, k) = row * topk + k
+        ids = topk_ids[rows].reshape(-1)
+        for start, proj in ((0, "gate_proj"), (width, "up_proj")):
+            if proj in self.parts:
+                a, b = self.parts[proj]
+                delta = (expert_lora(x, ids, a, b) * self.scaling).to(gate_up.dtype)
+                gate_up[rows, :, start : start + width] += delta.view(len(rows), topk, width)
+
+    def after_down(self, rows, activated, down, topk_weights, topk_ids):
+        if "down_proj" not in self.parts:
+            return
+        tokens, topk, _ = down.shape
+        h = activated[: tokens * topk].view(tokens, topk, -1)[rows].reshape(len(rows) * topk, -1)
+        a, b = self.parts["down_proj"]
+        delta = expert_lora(h, topk_ids[rows].reshape(-1), a, b) * self.scaling
+        delta = delta.view(len(rows), topk, -1) * topk_weights[rows, :, None].to(delta.dtype)
         down[rows] += delta.to(down.dtype)
 
 
@@ -195,6 +295,30 @@ def attach_uno_mova_lora(manager: LoRAManager, model: torch.nn.Module, lora_path
         param = next(decoder.parameters())
         # The manager's device, not the layer's: --cpu-offload-gb keeps offloaded layer weights on the CPU.
         a, b = (ab[k].to(device=manager.device, dtype=param.dtype) for k in "AB")
+        if name == "self_attn.v_experts" and a.ndim == 3:
+            # per-expert value LoRA, native layout: A [E, r, in], B [E, out, r]
+            if a.shape[1] != config["r"] or b.shape[2] != config["r"] or a.shape[0] != b.shape[0]:
+                raise ValueError(f"Layer {layer} {name}: per-expert LoRA shapes {tuple(a.shape)}/{tuple(b.shape)} vs rank {config['r']}.")
+            module = decoder.self_attn
+            if module.v_experts.output_size_per_partition != module.v_experts.output_size:
+                raise ValueError("--uno-mova-lora supports TP=1 only.")
+            if a.shape[0] != module.v_experts.weight.shape[0]:
+                raise ValueError(
+                    f"Layer {layer} {name}: {a.shape[0]} per-expert adapters for {module.v_experts.weight.shape[0]} value experts."
+                )
+            module.uno_value_lora = UnoMovaPerExpertValueLoRA(a, b, scaling, backend)
+            attached += 1
+            continue
+        if name in _EXPERTS and a.ndim == 3:
+            # per-expert routed FFN LoRA, native layout: A [E, r, in], B [E, out, r]
+            num_experts = layers[layer].mlp.experts.num_experts
+            if a.shape[1] != config["r"] or b.shape[2] != config["r"] or a.shape[0] != b.shape[0]:
+                raise ValueError(f"Layer {layer} {name}: per-expert LoRA shapes {tuple(a.shape)}/{tuple(b.shape)} vs rank {config['r']}.")
+            if a.shape[0] != num_experts:
+                raise ValueError(f"Layer {layer} {name}: {a.shape[0]} per-expert adapters for {num_experts} routed experts.")
+            experts[layer][name.rpartition(".")[2]] = (a.contiguous(), b.contiguous())
+            attached += 1
+            continue
         if a.shape[0] != config["r"] or b.shape[1] != config["r"]:
             raise ValueError(f"Layer {layer} {name}: LoRA shapes {tuple(a.shape)}/{tuple(b.shape)} vs rank {config['r']}.")
         if name == "self_attn.v_experts":
@@ -218,5 +342,9 @@ def attach_uno_mova_lora(manager: LoRAManager, model: torch.nn.Module, lora_path
         module = layers[layer].get_submodule(name)
         module.register_forward_hook(_RowHook(parts, scaling, backend))
     for layer, parts in experts.items():
-        _attach_expert_lora(layers[layer].mlp.experts, UnoMovaExpertLoRA(parts, scaling, backend))
+        per_expert = {p[0].ndim == 3 for p in parts.values()}
+        if len(per_expert) != 1:
+            raise ValueError(f"Layer {layer}: routed experts LoRA mixes per-expert and shared projections.")
+        cls = UnoMovaPerExpertExpertLoRA if per_expert.pop() else UnoMovaExpertLoRA
+        _attach_expert_lora(layers[layer].mlp.experts, cls(parts, scaling, backend))
     logger.info("UNO MoVA LoRA: %d adapters on %d layers (scaling %.1f).", attached, len(layers), scaling)
