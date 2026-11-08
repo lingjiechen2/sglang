@@ -68,6 +68,18 @@ def _delta(x: torch.Tensor, a: torch.Tensor, b: torch.Tensor, scaling: float) ->
     return F.linear(F.linear(x, a), b) * scaling
 
 
+def shard_lora(proj: str, a: torch.Tensor, b: torch.Tensor, rank: int, size: int):
+    """This TP rank's part of a full LoRA ``(A [r, in], B [out, r])`` on a projection of the base model.
+
+    gate/up are column parallel (their output rows are sharded: slice B's rows); down is row parallel (its input
+    columns are sharded: slice A's columns, and the per-rank deltas add up to the full one)."""
+    if size == 1:
+        return a, b
+    if proj in ("gate_proj", "up_proj"):
+        return a, b.chunk(size, dim=0)[rank].contiguous()
+    return a.chunk(size, dim=1)[rank].contiguous(), b
+
+
 class UnoMovaValueLoRA:
     """Shared value-expert LoRA applied on the draft rows of a UNO block."""
 
@@ -229,9 +241,10 @@ class UnoMovaPerExpertExpertLoRA(UnoMovaExpertLoRA):
 class _RowHook:
     """Forward hook adding LoRA deltas to chosen column slices of a linear layer's output."""
 
-    def __init__(self, parts, scaling, lora_backend):
+    def __init__(self, parts, scaling, lora_backend, all_reduce=None):
         self.parts = parts  # [(column start, column end, A, B)]
         self.scaling, self.lora_backend = scaling, lora_backend
+        self.all_reduce = all_reduce  # row-parallel layers that already reduced their output: reduce the delta too
 
     def __call__(self, module, inputs, output):
         x, (out, *rest) = inputs[0], output
@@ -241,7 +254,10 @@ class _RowHook:
         out = out.clone()
         xr = x[rows]
         for start, end, a, b in self.parts:
-            out[rows, start:end] += _delta(xr, a, b, self.scaling).to(out.dtype)
+            delta = _delta(xr, a, b, self.scaling)
+            if self.all_reduce is not None:
+                delta = self.all_reduce(delta)
+            out[rows, start:end] += delta.to(out.dtype)
         return (out, *rest)
 
 
@@ -262,8 +278,10 @@ def _attach_expert_lora(moe, lora: UnoMovaExpertLoRA) -> None:
 
     if get_exec().moe.enable_fused_moe_sum_all_reduce:
         raise ValueError("--uno-mova-lora with routed FFN-expert LoRA needs the fused MoE sum all-reduce off.")
-    if moe.moe_tp_size != 1 or moe.moe_ep_size != 1:
-        raise ValueError("--uno-mova-lora supports TP=1 only.")
+    if moe.moe_ep_size != 1:
+        raise ValueError("--uno-mova-lora does not support expert parallelism.")
+    if moe.moe_tp_size != 1 and isinstance(lora, UnoMovaPerExpertExpertLoRA):
+        raise ValueError("--uno-mova-lora supports per-expert FFN LoRA at TP=1 only.")
     runner.uno_lora_hooks = lora
 
 
@@ -272,8 +290,6 @@ def attach_uno_mova_lora(manager: LoRAManager, model: torch.nn.Module, lora_path
     from sglang.srt.models.xllm import XllmMoVAAttention
 
     path = os.path.join(lora_path, MOVA_LORA_FILE)
-    if not any(isinstance(m, XllmMoVAAttention) for m in model.modules()):
-        raise ValueError("--uno-mova-lora needs a model with MoVA attention layers.")
     if not os.path.exists(path):
         raise ValueError(f"--uno-mova-lora found no {MOVA_LORA_FILE} in {lora_path}.")
     with open(os.path.join(lora_path, "adapter_config.json")) as f:
@@ -285,7 +301,15 @@ def attach_uno_mova_lora(manager: LoRAManager, model: torch.nn.Module, lora_path
         if match is None:
             raise ValueError(f"Unexpected tensor {key} in {path}.")
         found[(int(match.group(1)), match.group(2))][match.group(3)] = tensor
+    if any(name == "self_attn.v_experts" for _, name in found) and not any(
+        isinstance(m, XllmMoVAAttention) for m in model.modules()
+    ):
+        raise ValueError("The value-expert LoRA needs a model with MoVA attention layers.")
 
+    from sglang.srt.runtime_context import get_parallel
+
+    tp_group = get_parallel().tp_group
+    tp_rank, tp_size = tp_group.rank_in_group, tp_group.world_size
     backend, layers = manager.lora_backend, model.model.layers
     hooks = defaultdict(list)  # (layer, linear module path) -> [(start, end, A, B)]
     experts = defaultdict(dict)  # layer -> {projection: (A, B)}
@@ -327,20 +351,29 @@ def attach_uno_mova_lora(manager: LoRAManager, model: torch.nn.Module, lora_path
                 raise ValueError("--uno-mova-lora supports TP=1 only.")
             module.uno_value_lora = UnoMovaValueLoRA(a, b, scaling, backend)
         elif name in _EXPERTS:
-            experts[layer][name.rpartition(".")[2]] = (a, b)
+            moe = layers[layer].mlp.experts
+            proj = name.rpartition(".")[2]
+            experts[layer][proj] = shard_lora(proj, a, b, moe.moe_tp_rank, moe.moe_tp_size)
         elif name in _LINEAR:
+            if name.startswith("self_attn.") and tp_size != 1:
+                raise ValueError("--uno-mova-lora supports MoVA q/k/v LoRA at TP=1 only.")
+            if name.endswith("down_proj"):
+                a, b = shard_lora("down_proj", a, b, tp_rank, tp_size)
             hooks[(layer, name)].append((0, b.shape[0], a, b))
         else:
             parent, _, proj = name.rpartition(".")
             if parent not in _GATE_UP or proj not in ("gate_proj", "up_proj"):
                 raise ValueError(f"Layer {layer}: unsupported MoVA LoRA module {name}.")
+            a, b = shard_lora(proj, a, b, tp_rank, tp_size)
             width = b.shape[0]
             start = 0 if proj == "gate_proj" else width
             hooks[(layer, f"{parent}.gate_up_proj")].append((start, start + width, a, b))
         attached += 1
     for (layer, name), parts in hooks.items():
         module = layers[layer].get_submodule(name)
-        module.register_forward_hook(_RowHook(parts, scaling, backend))
+        # A row-parallel layer with reduce_results has already summed its ranks: sum the delta's partials the same way.
+        reduce = tp_group.all_reduce if tp_size > 1 and name.endswith("down_proj") and module.reduce_results else None
+        module.register_forward_hook(_RowHook(parts, scaling, backend, reduce))
     for layer, parts in experts.items():
         per_expert = {p[0].ndim == 3 for p in parts.values()}
         if len(per_expert) != 1:
