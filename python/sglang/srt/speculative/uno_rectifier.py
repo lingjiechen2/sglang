@@ -97,6 +97,9 @@ def _rectified_chain_kernel(
             )
             probs = tl.where(keep & (probs >= cutoff), probs, 0.0)
             probs = probs / tl.sum(probs, axis=0)
+            # Triton's fp32 division is approximate: a one-token nucleus can come out as
+            # 1 + 1 ulp, which the chain verifier's q <= 1 guard treats as invalid and rejects.
+            probs = tl.minimum(probs, 1.0)
             tl.store(draft_probs + row + offsets, probs, mask=in_bounds)
             # Gumbel-max on log q samples exactly the published q.
             uniform = tl.load(uniforms + row + offsets, mask=in_bounds, other=0.5)
@@ -117,15 +120,22 @@ def _tree_children_kernel(
     child_tokens,  # [B, S, K, TOP] int64 output
     child_log_probs,  # [B, S, K, TOP] fp32 output
     child_slots,  # [B, S, K, TOP] int64 output
+    root_noise,  # [B, V] fp32 Gumbel noise ranking the first row (HAS_NOISE)
+    noise_stride,
+    noise_penalty,  # fp32 log-prob penalty of the other first-row candidates (NOISE_MODE 1)
     S,
     K: tl.constexpr,
     TOP: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    HAS_NOISE: tl.constexpr = False,
+    NOISE_MODE: tl.constexpr = 0,
 ):
     """Rectified children of one tree parent: lattice candidate p of row j - 1.
 
     The row is log-normalized over the lattice and its TOP best candidates are
-    returned best first, ties toward the lower lattice slot.
+    returned best first, ties toward the lower lattice slot.  With HAS_NOISE the
+    first row is ranked by score + Gumbel noise (the verify samples the root with
+    the same noise); the stored log-probs stay the noise-free ones.
     """
     row = tl.program_id(0).to(tl.int64)  # (b, j, p)
     batch_row = row // K  # (b, j)
@@ -143,14 +153,32 @@ def _tree_children_kernel(
     scores = tl.where(in_bounds, scores * inverse_temperature, float("-inf"))
     peak = tl.max(scores, axis=0)
     normalizer = peak + tl.log(tl.sum(tl.exp(scores - peak), axis=0))
+    ranking = scores
+    coupled = (batch_row % S) == 0  # the first row, below the root
+    if HAS_NOISE:
+        tokens = tl.load(candidates + batch_row * K + offsets, mask=in_bounds & coupled, other=0)
+        noise = tl.load(
+            root_noise + batch * noise_stride + tokens, mask=in_bounds & coupled, other=0.0
+        )
+        ranking = tl.where(in_bounds, scores + noise, float("-inf"))
     for rank in tl.static_range(TOP):
-        best = tl.max(scores, axis=0)
-        slot = tl.argmax(scores, axis=0)
+        slot = tl.argmax(ranking, axis=0)
+        best = tl.sum(tl.where(offsets == slot, scores, 0.0), axis=0)
         out = row * TOP + rank
-        tl.store(child_log_probs + out, tl.minimum(best - normalizer, 0.0))
+        log_prob = tl.minimum(best - normalizer, 0.0)
+        if NOISE_MODE >= 1:
+            # The coupled verify accepts the first noisy candidate with probability
+            # ~1 - TV(p, q): tell the tree builder so it spends nodes below it.
+            if rank == 0:
+                log_prob = tl.where(coupled, 0.0, log_prob)
+            elif NOISE_MODE == 2:
+                log_prob = tl.where(coupled, -30.0, log_prob)
+            else:
+                log_prob = tl.where(coupled, log_prob - noise_penalty, log_prob)
+        tl.store(child_log_probs + out, log_prob)
         tl.store(child_slots + out, slot.to(tl.int64))
         tl.store(child_tokens + out, tl.load(candidates + batch_row * K + slot))
-        scores = tl.where(offsets == slot, float("-inf"), scores)
+        ranking = tl.where(offsets == slot, float("-inf"), ranking)
 
 
 class UnoRectifiedTreeChildren(msgspec.Struct, frozen=True):
@@ -202,6 +230,7 @@ class UnoRectifier:
         self,
         draft_logits: torch.Tensor,
         first_prev_tokens: torch.Tensor,
+        first_row_bias: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Top-K base candidates per row and every candidate transition bias.
 
@@ -242,6 +271,9 @@ class UnoRectifier:
             torch.nn.functional.embedding(prev_tokens, self.markov_w1),
             torch.nn.functional.embedding(candidates, self.markov_w2).transpose(-1, -2),
         )
+        if not first_row_bias:
+            # Row 0 is the clean token's row, which the rectifier never trained on.
+            biases[:, 0].zero_()
         return values, candidates, biases
 
     @torch.inference_mode()
@@ -333,6 +365,10 @@ class UnoRectifier:
         root_tokens: torch.Tensor,
         temperatures: torch.Tensor,
         top_k: int,
+        first_row_bias: bool = True,
+        root_noise: Optional[torch.Tensor] = None,
+        noise_mode: int = 0,
+        noise_penalty: float = 0.0,
     ) -> UnoRectifiedTreeChildren:
         """Rectified top-``top_k`` children of every lattice parent.
 
@@ -340,9 +376,13 @@ class UnoRectifier:
         root ``root_tokens`` [B].  Each node's children are conditioned on the
         node's own token, so a tree built from them follows the rectified
         proposal instead of one shared candidate list per depth.
+        ``root_noise`` [B, V] (Gumbel) ranks the first row's children by score plus
+        noise, coupling them with a verify that samples the root with that noise.
         """
         batch_size, num_rows, _ = draft_logits.shape
-        values, candidates, biases = self._build_lattice(draft_logits, root_tokens)
+        values, candidates, biases = self._build_lattice(
+            draft_logits, root_tokens, first_row_bias=first_row_bias
+        )
         num_candidates = candidates.shape[-1]
         if top_k > num_candidates:
             raise ValueError(
@@ -361,10 +401,15 @@ class UnoRectifier:
             tokens,
             log_probs,
             slots,
+            root_noise if root_noise is not None else log_probs,
+            root_noise.stride(0) if root_noise is not None else 0,
+            float(noise_penalty),
             num_rows,
             K=num_candidates,
             TOP=top_k,
             BLOCK_K=triton.next_power_of_2(num_candidates),
+            HAS_NOISE=root_noise is not None,
+            NOISE_MODE=noise_mode,
             num_warps=2,
         )
         return UnoRectifiedTreeChildren(tokens=tokens, log_probs=log_probs, slots=slots)

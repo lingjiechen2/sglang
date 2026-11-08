@@ -744,6 +744,7 @@ def eagle_sample(
     logits_output: LogitsProcessorOutput,
     grammar_mask: Optional[GrammarMask] = None,
     uno_target_max_top_k: Optional[int] = None,
+    uno_root_noise: Optional[torch.Tensor] = None,
     *,
     watermark_state: Optional[WatermarkState] = None,
     watermark_full_mask: bool = True,
@@ -976,9 +977,18 @@ def eagle_sample(
             sampling_info.temperatures, verify_input.draft_token_num, dim=0
         )  # (bs * num_draft_tokens, 1)
 
-        target_probs = sampling_softmax(
-            next_token_logits, temperatures=expanded_temperature
-        )  # (bs * num_draft_tokens, vocab_size)
+        if uno_target_max_top_k is not None:
+            # UNO tree verify: few rows over a ~250K vocabulary, where the
+            # one-block-per-row softmax leaves most SMs idle.
+            from sglang.srt.speculative.uno_utils import _split_row_softmax
+
+            target_probs = _split_row_softmax(
+                next_token_logits.float() / expanded_temperature
+            )
+        else:
+            target_probs = sampling_softmax(
+                next_token_logits, temperatures=expanded_temperature
+            )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
         if sampling_info.need_top_k_sampling:
             target_probs = top_k_renorm_prob(
@@ -997,6 +1007,21 @@ def eagle_sample(
             )
             maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
+        if (
+            uno_root_noise is not None
+            and not use_rejection_sampling
+            and uno_root_noise.shape == (bs, target_probs.shape[-1])
+        ):
+            # Coupled root (UNO seed-root trees): the root's target token is the
+            # Gumbel-max sample argmax(log p + G), an exact sample of p, with the
+            # noise G that ranked the draft's first-level candidates. A one-hot
+            # root row makes the kernel accept that token if it is a child and
+            # emit it as the bonus otherwise.
+            root_probs = target_probs[:, 0, :]
+            root_tokens = torch.argmax(
+                torch.log(root_probs) + uno_root_noise, dim=-1, keepdim=True
+            )
+            root_probs.zero_().scatter_(1, root_tokens, 1.0)
         draft_probs = (
             verify_input.draft_probs
             if use_rejection_sampling

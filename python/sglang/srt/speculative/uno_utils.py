@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
 import torch
+import triton
+import triton.language as tl
 from flashinfer import top_k as _flashinfer_top_k
 
 from sglang.kernels.ops.speculative.reject_sampling import (
@@ -17,6 +20,59 @@ from sglang.srt.speculative.spec_utils import fast_sample
 from sglang.srt.speculative.uno_rectifier import UnoRectifier
 
 _SPARSE_TOP_K_LIMIT = 128
+_SOFTMAX_CHUNK = 8192
+
+
+@triton.jit
+def _softmax_chunk_stats_kernel(x, row_max, row_sum, vocab, CHUNK: tl.constexpr, NUM_CHUNKS: tl.constexpr):
+    row = tl.program_id(0)
+    chunk = tl.program_id(1)
+    offs = chunk * CHUNK + tl.arange(0, CHUNK)
+    v = tl.load(x + row.to(tl.int64) * vocab + offs, mask=offs < vocab, other=-float("inf")).to(tl.float32)
+    m = tl.max(v, axis=0)
+    tl.store(row_max + row * NUM_CHUNKS + chunk, m)
+    # A fully masked chunk (all -inf) contributes nothing; exp(-inf - -inf) is NaN.
+    s = tl.where(m == -float("inf"), 0.0, tl.sum(tl.exp(v - m), axis=0))
+    tl.store(row_sum + row * NUM_CHUNKS + chunk, s)
+
+
+@triton.jit
+def _softmax_normalize_kernel(x, out, row_max, row_sum, vocab, CHUNK: tl.constexpr, NUM_CHUNKS: tl.constexpr):
+    row = tl.program_id(0)
+    chunk = tl.program_id(1)
+    k = tl.arange(0, NUM_CHUNKS)
+    used = k < tl.num_programs(1)
+    maxes = tl.load(row_max + row * NUM_CHUNKS + k, mask=used, other=-float("inf"))
+    m = tl.max(maxes, axis=0)
+    sums = tl.load(row_sum + row * NUM_CHUNKS + k, mask=used, other=0.0)
+    total = tl.sum(tl.where(used, sums * tl.exp(maxes - m), 0.0), axis=0)
+    offs = chunk * CHUNK + tl.arange(0, CHUNK)
+    v = tl.load(x + row.to(tl.int64) * vocab + offs, mask=offs < vocab, other=-float("inf")).to(tl.float32)
+    tl.store(out + row.to(tl.int64) * vocab + offs, tl.exp(v - m) / total, mask=offs < vocab)
+
+
+def _split_row_softmax(logits: torch.Tensor) -> torch.Tensor:
+    """fp32 softmax over the last dim with each row split across many blocks.
+
+    The verify and draft rows are few (B * (F + 1)) and the vocabulary large, so
+    torch's one-block-per-row softmax leaves most SMs idle (9 x 248320 on H200:
+    61 -> 10 us).
+    """
+    logits = logits.contiguous()
+    rows, vocab = logits.shape
+    num_chunks = triton.next_power_of_2(triton.cdiv(vocab, _SOFTMAX_CHUNK))
+    # Only the first cdiv(vocab, CHUNK) columns are written and read.
+    row_max = torch.empty((rows, num_chunks), dtype=torch.float32, device=logits.device)
+    row_sum = torch.empty((rows, num_chunks), dtype=torch.float32, device=logits.device)
+    out = torch.empty((rows, vocab), dtype=torch.float32, device=logits.device)
+    grid = (rows, triton.cdiv(vocab, _SOFTMAX_CHUNK))
+    _softmax_chunk_stats_kernel[grid](
+        logits, row_max, row_sum, vocab, CHUNK=_SOFTMAX_CHUNK, NUM_CHUNKS=num_chunks, num_warps=8
+    )
+    _softmax_normalize_kernel[grid](
+        logits, out, row_max, row_sum, vocab, CHUNK=_SOFTMAX_CHUNK, NUM_CHUNKS=num_chunks, num_warps=8
+    )
+    return out
 
 
 def _normalize_sparse_topk_probs(
@@ -286,6 +342,7 @@ def _build_dense_probs(
         max_top_k=max_top_k,
         uniform_top_k_value=uniform_top_k_value,
         use_sparse_topk=True,
+        dense_softmax=_split_row_softmax,
     )
 
 
@@ -293,6 +350,111 @@ def _sample_from_dense_probs(probs: torch.Tensor) -> torch.Tensor:
     """Sample one token from every dense distribution row."""
     _, token_ids = fast_sample(probs.flatten(0, 1))
     return token_ids.view(probs.shape[:2])
+
+
+_REJECT_CHUNK = 8192
+_SPLIT_REJECTION = os.environ.get("UNO_SPLIT_REJECTION", "0") == "1"
+
+
+@triton.jit
+def _chain_accept_kernel(
+    candidates, target_probs, draft_probs, uniforms, accepted, sample_row,
+    vocab, F: tl.constexpr, NUM_ROWS_Q: tl.constexpr,
+):
+    """Linear-chain p/q acceptance (same test as the classic kernel): returns the
+    accepted count and the row whose residual (or, all accepted, whose target p)
+    the correction token is sampled from (row == F - 1 means plain target p)."""
+    b = tl.program_id(0)
+    n = 0
+    go = 1
+    for step in tl.static_range(1, F):
+        if go == 1:
+            tok = tl.load(candidates + b * F + step).to(tl.int64)
+            p = tl.load(target_probs + (b * F + step - 1).to(tl.int64) * vocab + tok)
+            q = tl.load(draft_probs + (b * NUM_ROWS_Q + step - 1).to(tl.int64) * vocab + tok)
+            coin = tl.load(uniforms + b * F + step - 1)
+            if ((q > 0.0) & (q <= 1.0)) & (coin * q < p):
+                n += 1
+            else:
+                go = 0
+    tl.store(accepted + b, n)
+    tl.store(sample_row + b, n)
+
+
+@triton.jit
+def _residual_race_kernel(
+    target_probs, draft_probs, sample_row, seed, best_score, best_idx,
+    vocab, F: tl.constexpr, NUM_ROWS_Q: tl.constexpr, CHUNK: tl.constexpr, NUM_CHUNKS: tl.constexpr,
+):
+    """Exponential race over one vocabulary chunk: argmax r_i / E_i with E_i ~ Exp(1)
+    picks i with probability r_i / sum(r), so the chunk maxima reduce to an exact
+    sample of the residual max(p - q, 0) (or of p when every proposal passed)."""
+    b = tl.program_id(0)
+    c = tl.program_id(1)
+    row = tl.load(sample_row + b)
+    offs = c * CHUNK + tl.arange(0, CHUNK)
+    mask = offs < vocab
+    p = tl.load(target_probs + (b * F + row).to(tl.int64) * vocab + offs, mask=mask, other=0.0)
+    if row < F - 1:
+        q = tl.load(draft_probs + (b * NUM_ROWS_Q + row).to(tl.int64) * vocab + offs, mask=mask, other=0.0)
+        q = tl.where((q >= 0.0) & (q <= 1.0), q, 0.0)
+        r = tl.maximum(p - q, 0.0)
+    else:
+        r = p
+    u = tl.rand(seed, (b.to(tl.int64) * vocab + offs).to(tl.int32))
+    e = -tl.log(tl.maximum(u, 1e-30))
+    score = tl.where(mask & (r > 0.0), r / e, -1.0)
+    best = tl.max(score, axis=0)
+    idx = tl.argmax(score, axis=0)
+    tl.store(best_score + b * NUM_CHUNKS + c, best)
+    tl.store(best_idx + b * NUM_CHUNKS + c, c * CHUNK + idx)
+
+
+@triton.jit
+def _race_reduce_kernel(best_score, best_idx, out_tokens, vocab, NUM_CHUNKS: tl.constexpr, CHUNKS_PAD: tl.constexpr):
+    b = tl.program_id(0)
+    k = tl.arange(0, CHUNKS_PAD)
+    m = k < NUM_CHUNKS
+    sc = tl.load(best_score + b * NUM_CHUNKS + k, mask=m, other=-2.0)
+    ix = tl.load(best_idx + b * NUM_CHUNKS + k, mask=m, other=0)
+    j = tl.argmax(sc, axis=0)
+    tok = tl.sum(tl.where(k == j, ix, 0), axis=0)
+    # Degenerate residual (all zero): fall back to the last token like the classic kernel.
+    tok = tl.where(tl.max(sc, axis=0) < 0.0, vocab - 1, tok)
+    tl.store(out_tokens + b, tok)
+
+
+def _split_dense_rejection(candidates, target_probs, draft_probs, accept_uniforms):
+    """Multi-block replacement for the classic chain kernel's correction sampling
+    (UNO_SPLIT_REJECTION=1): same acceptance test and coins; the correction token
+    is an exact sample of the same distribution via an exponential race split
+    across the vocabulary instead of one block's two-pass CDF scan."""
+    batch_size, width = candidates.shape
+    vocab = target_probs.shape[-1]
+    num_rows_q = draft_probs.shape[1]
+    dev = candidates.device
+    tp = target_probs.contiguous()
+    dp = draft_probs.contiguous()
+    accepted = torch.empty((batch_size,), dtype=torch.int32, device=dev)
+    sample_row = torch.empty((batch_size,), dtype=torch.int32, device=dev)
+    _chain_accept_kernel[(batch_size,)](
+        candidates.contiguous(), tp, dp, accept_uniforms.contiguous(), accepted, sample_row,
+        vocab, F=width, NUM_ROWS_Q=num_rows_q,
+    )
+    num_chunks = triton.cdiv(vocab, _REJECT_CHUNK)
+    best_score = torch.empty((batch_size, num_chunks), dtype=torch.float32, device=dev)
+    best_idx = torch.empty((batch_size, num_chunks), dtype=torch.int32, device=dev)
+    seed = int(torch.randint(0, 2**31 - 1, (1,)).item())
+    _residual_race_kernel[(batch_size, num_chunks)](
+        tp, dp, sample_row, seed, best_score, best_idx,
+        vocab, F=width, NUM_ROWS_Q=num_rows_q, CHUNK=_REJECT_CHUNK, NUM_CHUNKS=num_chunks, num_warps=8,
+    )
+    tokens = torch.empty((batch_size,), dtype=torch.int64, device=dev)
+    _race_reduce_kernel[(batch_size,)](
+        best_score, best_idx, tokens, vocab, NUM_CHUNKS=num_chunks,
+        CHUNKS_PAD=triton.next_power_of_2(num_chunks),
+    )
+    return accepted, tokens.to(candidates.dtype)
 
 
 def _run_dense_rejection(
@@ -322,6 +484,10 @@ def _run_dense_rejection(
         dtype=torch.float32,
         device=next_token_logits.device,
     )
+    if _SPLIT_REJECTION:
+        return _split_dense_rejection(
+            candidates, target_probs, draft_distribution.probs, accept_uniforms
+        )
     final_uniforms = torch.rand(
         (batch_size,),
         dtype=torch.float32,
@@ -664,12 +830,23 @@ def sample_uno_tree_target_tokens(
 
 def pack_uno_tree_result(
     *,
-    clean_root_tokens: torch.Tensor,
+    clean_root_tokens: torch.Tensor | None,
     eagle_predict: torch.Tensor,
     eagle_accept_lens: torch.Tensor,
     draft_width: int,
+    batch_size: int | None = None,
 ) -> UnoTreeSamplingResult:
-    """Convert an internal EAGLE tree result into UNO's public row."""
+    """Convert an internal EAGLE tree result into UNO's public row.
+
+    ``clean_root_tokens`` is None for seed-root trees: the EAGLE path already
+    starts after the seed, so it is the whole row (up to F accepted + bonus)."""
+    if clean_root_tokens is None:
+        verify_width = eagle_predict.numel() // batch_size
+        predict_rows = eagle_predict.reshape(batch_size, verify_width)
+        output_ids = predict_rows.new_zeros((batch_size, draft_width + 1), dtype=torch.int64)
+        width = min(draft_width + 1, verify_width)
+        output_ids[:, :width].copy_(predict_rows[:, :width].to(dtype=output_ids.dtype))
+        return UnoTreeSamplingResult(output_ids=output_ids, accept_lens=eagle_accept_lens)
     clean_root_tokens = clean_root_tokens.reshape(-1).to(dtype=torch.int64)
     batch_size = clean_root_tokens.numel()
     verify_width = eagle_predict.numel() // batch_size

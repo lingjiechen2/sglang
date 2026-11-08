@@ -1153,7 +1153,9 @@ def build_speculative_verify_target_probs(
     max_top_k: Optional[int] = None,
     uniform_top_k_value: Optional[int] = None,
     use_sparse_topk: bool = True,
+    dense_softmax=None,
 ) -> torch.Tensor:
+    # dense_softmax: optional replacement for F.softmax over the full vocabulary.
     device = next_token_logits.device
     need_top_k = bool(getattr(sampling_info, "need_top_k_sampling", True))
     need_top_p = bool(getattr(sampling_info, "need_top_p_sampling", False))
@@ -1200,7 +1202,10 @@ def build_speculative_verify_target_probs(
             sparse_topk_applied = True
 
     if not sparse_topk_applied:
-        target_probs = F.softmax(scaled_logits, dim=-1)
+        if dense_softmax is not None:
+            target_probs = dense_softmax(scaled_logits)
+        else:
+            target_probs = F.softmax(scaled_logits, dim=-1)
         if need_top_k:
             target_probs = _dflash_top_k_renorm_prob(
                 target_probs,

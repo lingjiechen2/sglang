@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
+from functools import partial
+
 import torch
 
 from sglang.kernels.ops.attention.metadata import (
@@ -250,6 +252,19 @@ class FlashAttentionBackend(AttentionBackend):
         # For each layer, the sliding_window_size can be different. This is only used for preparing SWA metadata.
         # We use `layer.sliding_window_size` to decide whether to use SWA for each layer.
         self.sliding_window_size = model_runner.sliding_window_size
+        # UNO's private draft backend may cap the draft pass to the most recent
+        # keys (set by the UNO worker; -1 keeps full attention).
+        self.uno_draft_window = -1
+        # With uno_draft_sinks > 0 the draft reads sinks + window (StreamingLLM)
+        # through a compact page table instead of FA3's window_size.
+        self.uno_draft_sinks = 0
+        # Research path: a KV-compression policy for the UNO draft pass
+        # (uno_draft_kv_policy.py; set by the UNO worker, None = off).
+        self.uno_draft_kv_policy = None
+        # Quest sparse attention for the UNO draft pass (uno_draft_quest.py; None = off).
+        self.uno_draft_quest = None
+        # FP8 shadow KV for the UNO draft pass (uno_draft_kv8.py; None = off).
+        self.uno_draft_kv8 = None
         self.has_swa = (
             self.sliding_window_size is not None and self.sliding_window_size > -1
         )
@@ -1424,6 +1439,24 @@ class FlashAttentionBackend(AttentionBackend):
                 return None
         return (*buffers, locations)
 
+    def _uno_sink_window_table(self, page_table, cache_seqlens, num_rows):
+        """Compact page table for the UNO draft: the first ``uno_draft_sinks`` keys, then
+        the last ``uno_draft_window + num_rows`` keys (window + this pass's rows), so a
+        bottom-right causal FA3 call reads only those. Static shapes (CUDA-graph safe);
+        requests shorter than the table keep their whole cache. page_size 1 only."""
+        if self.page_size != 1:
+            raise ValueError("The UNO sink+window draft table needs page_size 1")
+        sinks, window = self.uno_draft_sinks, self.uno_draft_window
+        width = sinks + window + num_rows
+        n = cache_seqlens.to(torch.long)[:, None]
+        col = torch.arange(width, device=page_table.device)[None, :]
+        idx = torch.where(col < sinks, col, n - (window + num_rows) + (col - sinks))
+        idx = torch.where(n <= width, torch.minimum(col, n - 1), idx).clamp_min(0)
+        table = page_table.gather(1, idx).to(page_table.dtype)
+        lens = torch.clamp(cache_seqlens, max=width).to(cache_seqlens.dtype)
+        cu = torch.nn.functional.pad(torch.cumsum(lens, 0, dtype=torch.int32), (1, 0))
+        return table, lens, cu
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1520,6 +1553,14 @@ class FlashAttentionBackend(AttentionBackend):
             if is_swa_layer
             else (-1, -1)
         )
+        uno_sink_window = (
+            self.uno_draft_window > 0 and self.uno_draft_sinks > 0 and causal and not is_swa_layer
+        )
+        if self.uno_draft_window > 0 and self.uno_draft_sinks == 0 and causal and not is_swa_layer:
+            # The UNO draft pass attends to the last uno_draft_window keys only; the
+            # verify (another backend) keeps the full context, so only the proposals
+            # change.
+            window_size = (self.uno_draft_window, 0)
         q, q_rope, k_rope, fa_k_descale, fa_v_descale = self.prepare_paged_mha_query(
             q,
             q_rope,
@@ -1634,6 +1675,10 @@ class FlashAttentionBackend(AttentionBackend):
             cache_seqlens = metadata.cache_seqlens_int32
             max_seqlen_q = metadata.max_seq_len_q
             cu_seqlens_k = metadata.cu_seqlens_k
+            if uno_sink_window:
+                page_table, cache_seqlens, cu_seqlens_k = self._uno_sink_window_table(
+                    page_table, cache_seqlens, int(max_seqlen_q)
+                )
 
         # Use Flash Attention for prefill
         if not self.use_mla:
@@ -1641,6 +1686,44 @@ class FlashAttentionBackend(AttentionBackend):
             key_cache, value_cache = self.get_paged_mha_kv_cache(
                 layer,
             )
+            if (
+                self.uno_draft_kv8 is not None
+                and causal
+                and not is_swa_layer
+                and not layer.is_cross_attention
+            ):
+                o = self.uno_draft_kv8.attend(
+                    partial(flash_attn_with_kvcache, ver=self.fa_impl_ver, num_splits=self.num_splits),
+                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k, v, forward_batch.out_cache_loc, key_cache, value_cache, page_table,
+                    cache_seqlens, cu_seqlens_q, cu_seqlens_k, int(max_seqlen_q), layer, layer.scaling,
+                )
+                return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            if (
+                self.uno_draft_quest is not None
+                and causal
+                and not is_swa_layer
+                and not layer.is_cross_attention
+            ):
+                o = self.uno_draft_quest.attend(
+                    partial(flash_attn_with_kvcache, ver=self.fa_impl_ver, num_splits=self.num_splits),
+                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    key_cache, value_cache, page_table, cache_seqlens, cu_seqlens_q,
+                    int(max_seqlen_q), layer, forward_batch.req_pool_indices, layer.scaling,
+                )
+                return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            if (
+                self.uno_draft_kv_policy is not None
+                and causal
+                and not is_swa_layer
+                and not layer.is_cross_attention
+            ):
+                o = self.uno_draft_kv_policy.attend(
+                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    key_cache, value_cache, page_table, cache_seqlens, cu_seqlens_q,
+                    layer, forward_batch.req_pool_indices, layer.scaling,
+                )
+                return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             if layer.is_cross_attention:
                 page_table = metadata.encoder_page_table
                 cache_seqlens = metadata.encoder_lens_int32

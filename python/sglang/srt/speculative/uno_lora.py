@@ -233,7 +233,12 @@ def _quantize_uno_fused(manager: LoRAManager, kind: str) -> None:
         if gptq_dir:
             # Marlin-ready GPTQ results are cached next to the Hessians; a cached
             # weight needs no Hessian (and no GPTQ pass) on later starts.
-            cache = os.path.join(gptq_dir, "marlin_cache", f"{key}.int4g{UnoMarlinDraftWeight.group}.pt")
+            from sglang.srt.speculative.uno_draft_quant import _GPTQ_ACT_ORDER
+
+            suffix = {0: "", 1: ".ao", 2: ".ao2"}[_GPTQ_ACT_ORDER]
+            cache = os.path.join(
+                gptq_dir, "marlin_cache", f"{key}.int4g{UnoMarlinDraftWeight.group}{suffix}.pt"
+            )
             path = os.path.join(gptq_dir, f"{key}.pt")
             if os.path.exists(cache):
                 num_gptq += 1

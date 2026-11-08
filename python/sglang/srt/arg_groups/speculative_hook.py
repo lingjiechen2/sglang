@@ -475,8 +475,6 @@ def _handle_uno(server_args: ServerArgs) -> None:
     draft_quant = cfg.uno_draft_weight_quant
     if draft_quant != "none":
         topk = 1 if cfg.speculative_eagle_topk is None else int(cfg.speculative_eagle_topk)
-        if topk > 1:
-            raise ValueError("--uno-draft-weight-quant supports linear UNO only.")
         if draft_quant != "bf16" and not cfg.uno_fused_lora:
             raise ValueError(
                 "--uno-draft-weight-quant fp8/int4 quantizes the folded draft GEMMs "
@@ -488,10 +486,12 @@ def _handle_uno(server_args: ServerArgs) -> None:
             raise ValueError("--uno-draft-weight-quant does not support --uno-mova-lora.")
         if verify_width < 2:
             raise ValueError("--uno-draft-weight-quant needs a block size of at least 2.")
-        # Both passes run the seed row plus the F-token block: F + 1 rows. Count from
-        # the raw input so a repeated resolution does not add the row twice.
-        raw_width = getattr(server_args, "speculative_num_draft_tokens", None)
-        verify_width = (int(raw_width) if raw_width is not None else verify_width) + 1
+        if topk == 1:
+            # Linear: both passes run the seed row plus the F-token block: F + 1
+            # rows. Count from the raw input so a repeated resolution does not add
+            # the row twice. Tree mode keeps its Q nodes (the seed becomes the root).
+            raw_width = getattr(server_args, "speculative_num_draft_tokens", None)
+            verify_width = (int(raw_width) if raw_width is not None else verify_width) + 1
     declare_resolution(
         server_args,
         "_handle_uno",
@@ -525,6 +525,12 @@ def _handle_uno(server_args: ServerArgs) -> None:
             raise ValueError(
                 f"UNO tree mode requires Q >= F; got Q={verify_width}, F={draft_width}."
             )
+        if cfg.uno_draft_weight_quant != "none" and verify_width < draft_width + 1:
+            # Seed-root trees hold the seed plus a chain through all F draft rows.
+            raise ValueError(
+                "UNO tree mode with --uno-draft-weight-quant requires Q >= F + 1; "
+                f"got Q={verify_width}, F={draft_width}."
+            )
         if verify_width > 128:
             raise ValueError(
                 "UNO tree mode currently supports at most Q=128 verify nodes, "
@@ -537,9 +543,11 @@ def _handle_uno(server_args: ServerArgs) -> None:
                 f"Q*K={verify_width}*{candidate_top_k}={frontier_slots}."
             )
 
+        # Seed-root trees (quantized drafts) have one more level: the clean row.
+        tree_levels = speculative_num_steps + (1 if cfg.uno_draft_weight_quant != "none" else 0)
         tree_capacity = 1
         nodes_at_depth = 1
-        for _ in range(speculative_num_steps):
+        for _ in range(tree_levels):
             nodes_at_depth *= candidate_top_k
             tree_capacity += nodes_at_depth
             if tree_capacity >= verify_width:
@@ -551,13 +559,13 @@ def _handle_uno(server_args: ServerArgs) -> None:
                 f"F={draft_width}, K={candidate_top_k}."
             )
 
-        parent_width = candidate_top_k * max(speculative_num_steps - 1, 0) + 1
+        parent_width = candidate_top_k * max(tree_levels - 1, 0) + 1
         if verify_width - 1 > parent_width:
             raise ValueError(
                 "UNO tree mode cannot represent the requested Q in EAGLE's "
                 "parent-list ABI: "
                 f"Q-1={verify_width - 1} exceeds "
-                f"K*(F-2)+1={parent_width} for "
+                f"K*(levels-1)+1={parent_width} for "
                 f"F={draft_width}, K={candidate_top_k}."
             )
 

@@ -44,6 +44,15 @@ class UnoTreeGdnState:
                 f"UNO tree GDN needs {num_nodes} scratch nodes; the pool has {tree_nodes}."
             )
         self.draft_offset = tree_nodes
+        # Seed-root trees (quantized drafts): the seed is the verify root, so the
+        # verify starts from the committed state and the path commit includes it.
+        self.seed_in_tree = False
+        # Per-batch layout choice (quantized drafts): the verify kernels read
+        # seed_flag at run time (1 = clean-root, fold the saved seed), so the
+        # captured verify graphs serve both layouts; the eager commit reads
+        # seed_in_tree.
+        self.dynamic = False
+        self.seed_flag = torch.ones(1, dtype=torch.int32, device=conv.device)
         node_stride = tree_nodes + max_depth + 1
         num_v_heads, head_v_dim, head_k_dim = temporal.shape[2:]
         key_dim = (conv.shape[2] - num_v_heads * head_v_dim) // 2
@@ -131,7 +140,8 @@ def uno_tree_gdn_target_verify(
         parents,
         seed_x=state.seed_x[layer_index],
         save_seed=parents is None,
-        has_seed=parents is not None,
+        has_seed=parents is not None and not state.dynamic and not state.seed_in_tree,
+        seed_flag=state.seed_flag if parents is not None and state.dynamic else None,
     )
     q = conv_out[:, : layer.q_dim]
     k = conv_out[:, layer.q_dim : layer.q_dim + layer.k_dim]
@@ -157,7 +167,12 @@ def uno_tree_gdn_target_verify(
         ancestors=ancestors,
         max_depth=min(state.max_depth, num_nodes - 1),
         save_offset=0 if parents is not None else state.draft_offset,
-        seed_node=state.draft_offset if parents is not None else None,
+        seed_node=(
+            state.draft_offset
+            if parents is not None and (state.dynamic or not state.seed_in_tree)
+            else None
+        ),
+        seed_flag=state.seed_flag if parents is not None and state.dynamic else None,
     )
     return out.unsqueeze(0)
 
@@ -220,6 +235,8 @@ def commit_uno_tree_after_verify(
     batch_size = accept_lens.shape[0]
     offsets = torch.arange(batch_size, device=accept_index.device)[:, None] * num_nodes
     path = torch.where(accept_index >= 0, accept_index - offsets, -1)
+    state = get_uno_tree_gdn(req_to_token_pool)
     commit_uno_tree_path(
-        req_to_token_pool, req_pool_indices, path, accept_lens, with_seed=True
+        req_to_token_pool, req_pool_indices, path, accept_lens,
+        with_seed=not state.seed_in_tree,
     )

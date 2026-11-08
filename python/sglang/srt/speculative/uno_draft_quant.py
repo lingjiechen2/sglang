@@ -31,9 +31,10 @@ _DEFAULT_MAX_ROWS = {"int4": 64, "fp8": 48}
 # pipelines keep more weight loads in flight. Measured on H200 with Qwen3.8-27B
 # folded draft shapes (one CUDA graph per class), one forward's draft GEMMs plus
 # lm_head: 5.90 -> 4.97 ms at 8 rows, 6.38 -> 5.76 at 16, 8.89 -> 7.42 at 32; draft
-# GEMMs 12.04 -> 11.42 ms at 64. Shapes or row counts not listed, or tiles that do
-# not divide the weight, use the default launch. UNO_DRAFT_MARLIN_TUNED=0 disables
-# the table.
+# GEMMs 12.04 -> 11.42 ms at 64; with the 64-row bucket retuned (stages 6/8) and
+# o_proj-shaped GEMMs left in bf16 above 32 rows, 11.37 -> 10.78 ms. Shapes or row
+# counts not listed, or tiles that do not divide the weight, use the default launch.
+# UNO_DRAFT_MARLIN_TUNED=0 disables the table.
 _INT4_MARLIN_LAUNCH = {
     (5248, 6144): {  # attention o_proj, GDN out_proj
         8: (4, 256, 64, 128, 2),
@@ -44,31 +45,36 @@ _INT4_MARLIN_LAUNCH = {
         8: (4, 256, 64, 128, 3),
         16: (8, 128, 64, 128, 3),
         32: (8, 128, 64, 128, 2),
-        64: (8, 64, 128, 128, 1),
+        64: (6, 128, 128, 256, 1),
     },
     (16640, 5120): {  # GDN in_proj
         8: (4, 256, 64, 128, 2),
         16: (4, 256, 64, 128, 2),
         32: (8, 128, 64, 128, 2),
-        64: (8, 128, 128, 256, 1),
+        64: (6, 128, 128, 256, 1),
     },
     (34944, 5120): {  # MLP gate_up
         8: (4, 256, 128, 256, 2),
         16: (8, 64, 128, 128, 3),
         32: (4, 64, 128, 128, 2),
-        64: (4, 64, 128, 128, 2),
+        64: (6, -1, -1, -1, 2),
     },
     (5248, 17408): {  # MLP down
         8: (4, 256, 64, 128, 2),
         16: (4, 256, 64, 128, 2),
         32: (8, 128, 64, 128, 2),
-        64: (4, 128, 64, 128, 2),
+        64: (8, 128, 128, 256, 1),
     },
     (248320, 5120): {  # lm_head
         8: (4, 256, 128, 256, 2),
         16: (8, 64, 128, 128, 3),
+        64: (6, -1, -1, -1, 1),
     },
 }
+# Above these row counts the bf16 GEMM is faster than any measured Marlin launch, so
+# the draft keeps the bf16 weight there (H200, 64 rows: o_proj / GDN out_proj 1.06
+# vs 0.91 ms and 0.36 vs 0.31 ms per forward; the Marlin 64-row bucket elsewhere).
+_INT4_BF16_ABOVE_ROWS = {(5248, 6144): 32}
 _LAUNCH_ROW_BUCKETS = (8, 16, 32, 64)
 _MAX_BLOCKS_PER_SM = 4
 
@@ -130,6 +136,76 @@ class UnoHessianCollector:
                 self.saved = True
                 self.hessian = None
         return torch.mm(x, self.weight.t())
+
+
+# GPTQ column order: UNO_DRAFT_GPTQ_ACT_ORDER=1 compensates the columns in
+# decreasing Hessian-diagonal order with static (original-layout) groups, so the
+# Marlin layout and the runtime GEMM are unchanged (no g_idx / activation perm).
+# =2 also takes each group's scale from the compensated weights when its first
+# column comes up in act order (like the natural-order GPTQ below).
+_GPTQ_ACT_ORDER = int(os.environ.get("UNO_DRAFT_GPTQ_ACT_ORDER", "0"))
+
+
+def _gptq_int4_act_order(
+    weight: torch.Tensor, hessian: torch.Tensor, group: int, dtype, block: int = 128,
+    dynamic_scales: bool = False,
+):
+    """GPTQ with act order and static groups: the group scales come from the
+    original weights; the columns are quantized and their errors compensated in
+    decreasing diag(H) order. Same returns as _gptq_int4."""
+    w = weight.float().clone()
+    n, k = w.shape
+    h = hessian.float().clone()
+    dead = torch.diag(h) == 0
+    h[dead, dead] = 1
+    w[:, dead] = 0
+    scales = (
+        w.view(n, k // group, group).abs().amax(dim=2).clamp_min(1e-12) / 7.0
+    ).to(dtype).float().t().contiguous()  # [K / group, N]
+    perm = torch.argsort(torch.diag(h), descending=True)
+    w = w[:, perm]
+    h = h[perm][:, perm]
+    h.diagonal().add_(0.01 * torch.diag(h).mean())
+    hinv = torch.linalg.cholesky(torch.cholesky_inverse(torch.linalg.cholesky(h)), upper=True)
+    col_group = perm // group
+    col_scales = scales[col_group].t()  # [N, K] scale of each permuted column
+    seen = torch.zeros(k // group, dtype=torch.bool)
+    pos = torch.empty(k, dtype=torch.long)
+    pos[perm] = torch.arange(k)
+    members = pos.view(k // group, group).to(w.device)  # permuted positions of each group
+    col_group_cpu = col_group.cpu()
+    q_perm = torch.empty(n, k, dtype=torch.int32, device=w.device)
+    for i1 in range(0, k, block):
+        i2 = min(i1 + block, k)
+        w1 = w[:, i1:i2].clone()
+        err1 = torch.zeros_like(w1)
+        h1 = hinv[i1:i2, i1:i2]
+        for i in range(i2 - i1):
+            g = int(col_group_cpu[i1 + i])
+            if dynamic_scales and not seen[g]:
+                seen[g] = True
+                # Current values of the group's columns: this block's from w1 (up to
+                # date), later blocks' from w (pending this block's lazy update).
+                idx = members[g]
+                vals = torch.where(
+                    ((idx >= i1) & (idx < i2))[None, :],
+                    w1[:, (idx - i1).clamp(0, i2 - i1 - 1)],
+                    w[:, idx],
+                )
+                sc_g = (vals.abs().amax(dim=1).clamp_min(1e-12) / 7.0).to(dtype).float()
+                scales[g] = sc_g
+                col_scales[:, members[g]] = sc_g[:, None]
+            sc = col_scales[:, i1 + i]
+            wc = w1[:, i]
+            qc = (wc / sc).round().clamp(-8, 7)
+            q_perm[:, i1 + i] = (qc + 8).to(torch.int32)
+            e = (wc - qc * sc) / h1[i, i]
+            w1[:, i:] -= e[:, None] * h1[i, i:][None, :]
+            err1[:, i] = e
+        w[:, i2:] -= err1 @ hinv[i1:i2, i2:]
+    q_all = torch.empty_like(q_perm)
+    q_all[:, perm] = q_perm
+    return q_all.t().contiguous(), scales
 
 
 def _gptq_int4(weight: torch.Tensor, hessian: torch.Tensor, group: int, dtype, block: int = 128):
@@ -206,6 +282,9 @@ class UnoMarlinDraftWeight:
         self.tuned = kind == "int4" and os.environ.get("UNO_DRAFT_MARLIN_TUNED", "1") != "0"
         if self.tuned:
             self.workspace = marlin_make_workspace(device, _MAX_BLOCKS_PER_SM)
+            self.max_rows = min(
+                self.max_rows, _INT4_BF16_ABOVE_ROWS.get((self.n, self.k), self.max_rows)
+            )
         if kind == "fp8":
             from sglang.srt.layers.quantization.marlin_utils_fp8 import (
                 fp8_fused_exponent_bias_into_scales,
@@ -233,7 +312,13 @@ class UnoMarlinDraftWeight:
                 self.quant_type = scalar_types.uint4b8
             elif hessian is not None:
                 # weight was padded to N; the Hessian is over K and unaffected.
-                q, scale = _gptq_int4(weight, hessian, self.group, weight.dtype)
+                if _GPTQ_ACT_ORDER:
+                    q, scale = _gptq_int4_act_order(
+                        weight, hessian, self.group, weight.dtype,
+                        dynamic_scales=_GPTQ_ACT_ORDER == 2,
+                    )
+                else:
+                    q, scale = _gptq_int4(weight, hessian, self.group, weight.dtype)
             else:
                 w = weight.t().float().contiguous()  # [K, N]
                 groups = w.view(self.k // self.group, self.group, self.n)

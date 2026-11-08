@@ -578,6 +578,7 @@ def run_eagle_verify(
     pp_proxy_tensors: Optional[PPProxyTensors] = None,
     grammar_barrier=None,
     uno_target_max_top_k: Optional[int] = None,
+    uno_root_noise: Optional[torch.Tensor] = None,
 ) -> GenerationBatchResult:
     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
 
@@ -701,6 +702,7 @@ def run_eagle_verify(
         logits_output,
         grammar_mask,
         uno_target_max_top_k=uno_target_max_top_k,
+        uno_root_noise=uno_root_noise,
         watermark_state=target_worker.model_runner.watermark_state,
         watermark_full_mask=(
             target_worker.model_runner.attn_backend.verify_mask is None
