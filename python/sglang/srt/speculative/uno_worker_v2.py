@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import logging
+import os
 import time
 from typing import TYPE_CHECKING, Optional
 
@@ -350,12 +351,21 @@ class UnoWorkerV2(BaseSpecWorker):
             raise AttributeError(name)
         return getattr(self.target_worker, name)
 
-    def _sync_tp(self, *tensors: torch.Tensor) -> None:
-        """Sampling draws per-rank random numbers: every TP rank adopts rank 0's result."""
+    def _sync_tp(self, **tensors: torch.Tensor) -> None:
+        """Every TP rank adopts rank 0's tensors (sampling draws per-rank random numbers).
+
+        With SGLANG_UNO_TP_CHECK=1 a rank logs each tensor that differed from rank 0 before adopting it."""
         group = get_parallel().tp_group
-        if group.world_size > 1:
-            for tensor in tensors:
-                group.broadcast(tensor, src=0)
+        if group.world_size == 1:
+            return
+        check = os.environ.get("SGLANG_UNO_TP_CHECK") == "1"
+        for name, tensor in tensors.items():
+            mine = tensor.clone() if check else None
+            group.broadcast(tensor, src=0)
+            if check and not torch.equal(mine, tensor):
+                logger.warning(
+                    "UNO TP check: rank %d differed from rank 0 on %s", group.rank_in_group, name
+                )
 
     def _validate_batch(self, batch: ScheduleBatch) -> None:
         if batch.forward_mode.is_idle():
@@ -687,7 +697,7 @@ class UnoWorkerV2(BaseSpecWorker):
                 uniform_top_k_value=draft_state.uniform_top_k_value,
             )
 
-        self._sync_tp(clean_root_tokens)
+        self._sync_tp(clean_root_tokens=clean_root_tokens)
         rectified_children = None
         if self.rectifier is not None and self.forward_width > 1:
             # Each tree node's children are rectified on the node's own token.
@@ -705,6 +715,12 @@ class UnoWorkerV2(BaseSpecWorker):
             temperature=sampling_info.temperatures,
             workspace=self._uno_tree_workspace,
             rectified_children=rectified_children,
+        )
+        self._sync_tp(
+            root_tokens=proposal.root_tokens,
+            parent_list=proposal.parent_list,
+            top_scores_index=proposal.top_scores_index,
+            draft_tokens=proposal.draft_tokens,
         )
 
         # The first pass wrote the carried seed at C.  Give EAGLE a shallow
@@ -902,7 +918,7 @@ class UnoWorkerV2(BaseSpecWorker):
                 uniform_top_k_value=uniform_top_k_value,
                 rectifier=self.rectifier,
             )
-            self._sync_tp(candidates)
+            self._sync_tp(candidates=candidates)
         elif self.rectifier is not None:
             candidates = rectify_uno_greedy_candidates(
                 candidates=candidates,
@@ -950,7 +966,12 @@ class UnoWorkerV2(BaseSpecWorker):
             accept_lens = sampling_result.accept_lens
             new_seq_lens = sampling_result.new_seq_lens
             correction = sampling_result.next_seed_tokens
-            self._sync_tp(output_ids, accept_lens, new_seq_lens, correction)
+            self._sync_tp(
+                output_ids=output_ids,
+                accept_lens=accept_lens,
+                new_seq_lens=new_seq_lens,
+                correction=correction,
+            )
 
         if self.recycle:
             tail, tail_lens = extract_uno_recycle_tail(candidates, accept_lens)
