@@ -339,6 +339,14 @@ def _run_dense_rejection(
         draft_token_num=forward_width,
         device=next_token_logits.device,
     )
+    from sglang.srt.speculative import uno_accept_debug as _dbg
+    if _dbg.enabled():
+        _dbg.record(
+            target_probs.view(batch_size, forward_width, -1)[:, : forward_width - 1],
+            draft_distribution.probs.view(batch_size, forward_width - 1, -1),
+            top_ps=sampling_info.top_ps if sampling_info.need_top_p_sampling else None,
+            tag="sglang_dense",
+        )
     chain_speculative_sampling_triton(
         predicts=predicts,
         accept_index=accept_index,
@@ -356,6 +364,56 @@ def _run_dense_rejection(
         deterministic=True,
     )
 
+    if _dbg.enabled():
+        _S = forward_width - 1
+        _x = candidates[:, 1:].to(torch.long)
+        _tp = target_probs.view(batch_size, forward_width, -1)[:, :_S]
+        _qp = draft_distribution.probs.view(batch_size, _S, -1)
+        _px = _tp.gather(2, _x[..., None]).squeeze(-1).float()
+        _qx = _qp.gather(2, _x[..., None]).squeeze(-1).float()
+        _r = torch.where(_qx > 0, (_px / _qx).clamp(max=1.0), torch.full_like(_px, float("nan")))
+        _j = torch.arange(_S, device=candidates.device)[None, :]
+        _acc = accepted_counts.to(torch.long)[:, None]
+        _dbg.record_realized(_r, (_acc >= _j), (_acc >= _j + 1), tag="sglang_dense")
+        _u = accept_uniforms[:, :_S].float()
+        _ref = (_u * _qx < _px).int().cumprod(1).sum(1)
+        _dbg._add("sglang_dense.kernel_vs_torch_mismatch", (_ref != accepted_counts[:batch_size].int()).float()[:, None])
+        _ri2 = torch.arange(batch_size * forward_width, dtype=torch.int64, device=candidates.device).view(batch_size, forward_width)
+        _pred2 = torch.zeros(batch_size * forward_width, dtype=torch.int32, device=candidates.device)
+        _aidx2 = torch.zeros(batch_size, forward_width, dtype=torch.int32, device=candidates.device)
+        _anum2 = torch.zeros(batch_size, dtype=torch.int32, device=candidates.device)
+        torch.cuda.synchronize()
+        chain_speculative_sampling_triton(
+            predicts=_pred2, accept_index=_aidx2, accept_token_num=_anum2, candidates=candidates.contiguous(),
+            retrive_index=_ri2, retrive_next_token=retrieve_next_token, retrive_next_sibling=retrieve_next_sibling,
+            uniform_samples=accept_uniforms, uniform_samples_for_final_sampling=final_uniforms,
+            target_probs=target_probs, draft_probs=draft_distribution.probs, threshold_single=1.0, threshold_acc=1.0,
+            deterministic=True,
+        )
+        torch.cuda.synchronize()
+        _dbg._add("sglang_dense.rerun_vs_torch_mismatch", (_ref != _anum2).float()[:, None])
+        _dbg._add("sglang_dense.rerun_vs_first_mismatch", (_anum2 != accepted_counts[:batch_size].int()).float()[:, None])
+        _mm = (_ref != accepted_counts[:batch_size].int()).nonzero().flatten()
+        if _mm.numel() and getattr(_dbg, "_ex_n", 0) < 40:
+            import json as _json
+            _dbg._ex_n = getattr(_dbg, "_ex_n", 0) + 1
+            b = int(_mm[0])
+            with open(_dbg.PATH + ".examples.jsonl", "a") as _f:
+                _f.write(_json.dumps(dict(
+                    kernel=int(accepted_counts[b]), rerun=int(_anum2[b]), torch=int(_ref[b]), bs=batch_size,
+                    cand=candidates[b].tolist(), px=_px[b].tolist(), qx=_qx[b].tolist(), u=_u[b].tolist(),
+                    tp_shape=list(target_probs.shape), tp_stride=list(target_probs.stride()), tp_dtype=str(target_probs.dtype),
+                    dp_shape=list(draft_distribution.probs.shape), dp_stride=list(draft_distribution.probs.stride()),
+                    dp_dtype=str(draft_distribution.probs.dtype), cand_dtype=str(candidates.dtype), cand_stride=list(candidates.stride()),
+                    u_stride=list(accept_uniforms.stride()))) + "\n")
+        _dbg._add("sglang_dense.u_mean", _u)
+        _dbg._add("sglang_dense.u_sq", _u * _u)
+        _dbg._add("sglang_dense.u_ptr_changes", torch.full((1, 1), float(accept_uniforms.data_ptr() % 1000003)))
+        import hashlib as _h
+        _key = float(_u[0, 0].item())
+        _prev = getattr(_dbg, "_last_u00", None)
+        _dbg._add("sglang_dense.u00_repeat", torch.full((1, 1), float(_prev == _key)))
+        _dbg._last_u00 = _key
     rows = torch.arange(batch_size, device=candidates.device)
     bonus_positions = accept_index[
         rows,
@@ -497,6 +555,11 @@ def _sample_rectified_candidates(
         top_ps = torch.ones(
             (batch_size,), dtype=torch.float32, device=draft_logits.device
         )
+    import os as _os
+    if _os.environ.get("UNO_DBG_Q_NO_TOPP") == "1":  # emulate nano top-k path: q not top-p truncated
+        top_ps = torch.ones((batch_size,), dtype=torch.float32, device=draft_logits.device)
+    if _os.environ.get("UNO_DBG_RECT_K"):  # emulate nano top-k path: lattice = base top-k candidates only
+        rectifier.num_candidates = int(_os.environ["UNO_DBG_RECT_K"])
     rectified = rectifier.sample(
         draft_logits=draft_logits[:, 1:, :],
         first_prev_tokens=clean_root_tokens,
@@ -637,6 +700,9 @@ def run_uno_sampling(
 ) -> UnoSamplingResult:
     """Verify sampled UNO proposals against target p and pack the result."""
     if draft_distribution.token_ids is not None:
+        from sglang.srt.speculative import uno_accept_debug as _dbg
+        if _dbg.enabled():
+            _dbg._add("sglang_sparse_path_used", torch.ones(1, 1))
         accepted, bonus = _run_sparse_rejection(
             candidates=candidates,
             next_token_logits=next_token_logits,
