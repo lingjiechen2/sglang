@@ -61,8 +61,14 @@ def init_uno_lora_manager(
     #   None             -> base model
     #   uno_ref.lora_id  -> base model + UNO draft LoRA
     manager.fetch_new_loras({None, uno_ref.lora_id})
+    # MoVA routed/value LoRA attaches its own per-layer tensors; leave that path exactly as before.
+    skipped_layers = (
+        frozenset()
+        if get_spec().uno_mova_lora
+        else _bypass_uno_lora_skipped_layers(manager, uno_ref.lora_id)
+    )
     if get_spec().uno_fused_lora:
-        _fold_uno_lora(manager, uno_ref.lora_id)
+        _fold_uno_lora(manager, uno_ref.lora_id, skipped_layers)
     if get_spec().uno_mova_lora:
         from sglang.srt.speculative.uno_mova_lora import attach_uno_mova_lora
 
@@ -71,8 +77,48 @@ def init_uno_lora_manager(
     return manager, uno_ref.lora_id
 
 
-def _fold_uno_lora(manager: LoRAManager, lora_id: str) -> None:
-    """Fold the resident UNO adapter's LoRA-A rows into each base GEMM."""
+def _uno_lora_skipped_layers(manager: LoRAManager, lora_id: str) -> frozenset[int]:
+    """Decoder layers the UNO adapter carries no weights for (LoRA layer skip).
+
+    Empty for an adapter trained on every layer. A layer counts as skipped only when the
+    adapter has no tensor at all for it; such a layer's LoRA buffers are all zero.
+    """
+    adapter = manager.loras[lora_id]
+    return frozenset(
+        layer_id
+        for layer_id, layer in enumerate(adapter.layers)
+        if layer_id < len(manager.lora_modules) and not layer.weights
+    )
+
+
+def _bypass_uno_lora_skipped_layers(manager: LoRAManager, lora_id: str) -> frozenset[int]:
+    """Send skipped layers down the plain base path for draft rows too.
+
+    Their LoRA delta is exactly zero, so this only removes the zero LoRA GEMMs; layers the
+    adapter covers (every layer, for a full adapter) are left untouched.
+    """
+    skipped = _uno_lora_skipped_layers(manager, lora_id)
+    if not skipped:
+        return skipped
+    for layer_id in skipped:
+        for module in manager.lora_modules[layer_id].values():
+            module.set_lora = False
+    logger.info(
+        "UNO LoRA layer skip: adapter has no weights for %d/%d layers %s; they run the base path.",
+        len(skipped),
+        len(manager.lora_modules),
+        sorted(skipped),
+    )
+    return skipped
+
+
+def _fold_uno_lora(
+    manager: LoRAManager, lora_id: str, skipped_layers: frozenset[int] = frozenset()
+) -> None:
+    """Fold the resident UNO adapter's LoRA-A rows into each base GEMM.
+
+    Layers in ``skipped_layers`` (no adapter weights) are not folded and keep the base GEMM.
+    """
     from sglang.srt.lora.backend.uno_fused_lora import (
         fold_uno_lora_group,
         fold_uno_lora_layer,
@@ -93,6 +139,8 @@ def _fold_uno_lora(manager: LoRAManager, lora_id: str) -> None:
     for module in manager.base_model.modules():
         if not isinstance(module, Qwen3_5GatedDeltaNet):
             continue
+        if getattr(module, "layer_id", None) in skipped_layers:
+            continue
         members = [module.in_proj_qkvz, module.in_proj_ba]
         fused = fold_uno_lora_group(members, **fold_kwargs)
         if fused is None:
@@ -102,7 +150,9 @@ def _fold_uno_lora(manager: LoRAManager, lora_id: str) -> None:
         num_groups += 1
 
     num_folded = num_kept = 0
-    for layer_modules in manager.lora_modules:
+    for layer_id, layer_modules in enumerate(manager.lora_modules):
+        if layer_id in skipped_layers:
+            continue
         for module in layer_modules.values():
             if id(module) in grouped:
                 continue
