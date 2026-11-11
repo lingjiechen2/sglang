@@ -10,6 +10,8 @@ from sglang.kernels.ops.speculative.reject_sampling import (
     chain_speculative_sampling_triton,
 )
 from sglang.srt.speculative.dflash_utils import (
+    _dflash_top_k_renorm_prob,
+    _dflash_top_p_renorm_prob,
     _get_or_create_chain_verify_buffers,
     build_speculative_verify_target_probs,
 )
@@ -24,13 +26,23 @@ def _normalize_sparse_topk_probs(
     temperatures: torch.Tensor,
     valid: torch.Tensor,
     top_ps: torch.Tensor,
+    log_normalizer: torch.Tensor,
 ) -> torch.Tensor:
-    """Normalize a compact top-k support with top-k-first top-p semantics."""
+    """Compact target support with the AR sampler's joint top-k / top-p semantics.
+
+    The sampler (flashinfer ``filter_apply_order="joint"``) takes the top-p nucleus of the
+    full-vocabulary distribution and intersects it with the top-k set. ``log_normalizer`` is the
+    full-vocabulary log-sum-exp of the temperature-scaled logits, so ``full`` below are the exact
+    full-vocabulary probabilities of the top-k tokens and the cumulative sum over the sorted
+    top-k tokens is the exact nucleus cumulative. Renormalizing the top-k support before the
+    nucleus cut (top-k first) would shrink the nucleus whenever the top-k set holds less than
+    all of the mass, and the target would no longer be the AR distribution.
+    """
     scaled = topk_logits.float() / temperatures
-    scaled = scaled.masked_fill(~valid, float("-inf"))
-    probs = torch.softmax(scaled, dim=-1)
-    cdf = torch.cumsum(probs, dim=-1)
-    probs = probs.masked_fill((cdf - probs) > top_ps, 0.0)
+    full = torch.exp(scaled - log_normalizer)
+    cdf = torch.cumsum(full, dim=-1)
+    keep = valid & ((cdf - full) <= top_ps)
+    probs = torch.where(keep, full, torch.zeros_like(full))
     return probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
 
 
@@ -164,11 +176,15 @@ def _build_sparse_target_support_tensors(
         dtype=expanded_top_ks.dtype,
         device=next_token_logits.device,
     )[None, :]
+    log_normalizer = torch.logsumexp(
+        next_token_logits.float() / expanded_temperatures, dim=-1, keepdim=True
+    )
     probs = _normalize_sparse_topk_probs(
         topk_logits,
         expanded_temperatures,
         ranks < expanded_top_ks,
         expanded_top_ps,
+        log_normalizer,
     )
     return (
         topk_ids.view(batch_size, forward_width, max_top_k),
@@ -277,7 +293,27 @@ def _build_dense_probs(
     max_top_k: int,
     uniform_top_k_value: int | None,
 ) -> torch.Tensor:
-    """Build the dense sampling distribution used by SGLang verification."""
+    """Build the dense sampling distribution used by SGLang verification.
+
+    With both top-k and top-p active this is the AR sampler's joint support: the top-p nucleus of
+    the full distribution intersected with the top-k set (see ``_normalize_sparse_topk_probs``).
+    """
+    need_top_k = bool(getattr(sampling_info, "need_top_k_sampling", True))
+    need_top_p = bool(getattr(sampling_info, "need_top_p_sampling", False))
+    if need_top_k and need_top_p:
+        temperatures = torch.repeat_interleave(
+            sampling_info.temperatures, forward_width, dim=0
+        )
+        probs = torch.softmax(next_token_logits / temperatures, dim=-1)
+        by_top_k = _dflash_top_k_renorm_prob(
+            probs, torch.repeat_interleave(sampling_info.top_ks, forward_width, dim=0)
+        )
+        nucleus = _dflash_top_p_renorm_prob(
+            probs, torch.repeat_interleave(sampling_info.top_ps, forward_width, dim=0)
+        )
+        joint = by_top_k.masked_fill(nucleus <= 0, 0.0)
+        joint = joint / joint.sum(dim=-1, keepdim=True)
+        return joint.view(batch_size, forward_width, -1).contiguous()
     return build_speculative_verify_target_probs(
         next_token_logits=next_token_logits,
         sampling_info=sampling_info,
