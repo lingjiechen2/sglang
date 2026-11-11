@@ -1,4 +1,7 @@
-"""CPU contracts: UNO's target support uses the AR sampler's joint top-k / top-p semantics."""
+"""Contracts: UNO's target support uses the AR sampler's joint top-k / top-p semantics.
+
+Runs on CUDA when available, so the dense path exercises the flashinfer renorm kernels it uses in
+production (they only accept CUDA tensors); on CPU-only hosts it checks the torch fallback."""
 
 import unittest
 from types import SimpleNamespace
@@ -14,14 +17,19 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
+_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
 
 def joint_reference(logits, temperature, top_k, top_p):
-    """Top-p nucleus of the full distribution intersected with the top-k set, renormalized."""
+    """Top-p nucleus of the full distribution intersected with the top-k set, renormalized.
+
+    flashinfer's rule: keep a token when the mass of the tokens strictly more likely than it is
+    below top_p, so tied tokens share one decision."""
     probs = torch.softmax(logits.double() / temperature, dim=-1)
     order = torch.argsort(probs, descending=True)
     sorted_probs = probs[order]
-    preceding = torch.cumsum(sorted_probs, dim=0) - sorted_probs
-    keep_sorted = (preceding <= top_p) & (torch.arange(len(order)) < top_k)
+    mass_above = (sorted_probs[None, :] * (sorted_probs[None, :] > sorted_probs[:, None])).sum(-1)
+    keep_sorted = (mass_above < top_p) & (torch.arange(len(order), device=probs.device) < top_k)
     out = torch.zeros_like(probs)
     out[order[keep_sorted]] = probs[order[keep_sorted]]
     return out / out.sum()
@@ -50,20 +58,20 @@ class TestUnoJointTopkTopp(CustomTestCase):
                 torch.randn(4, self.vocab) * 4.0,
                 torch.randn(4, self.vocab) * 1.5,
             ]
-        )
+        ).to(_DEVICE)
 
     def _sparse(self, top_ks, top_p, temperature=1.0):
         rows = self.logits.shape[0]
         max_k = int(max(top_ks))
         topk_logits, topk_ids = torch.topk(self.logits, max_k, dim=-1)
-        temps = torch.full((rows, 1), temperature)
+        temps = torch.full((rows, 1), temperature, device=_DEVICE)
         lse = torch.logsumexp(self.logits.float() / temps, dim=-1, keepdim=True)
-        ks = torch.tensor(top_ks).reshape(rows, 1)
-        valid = torch.arange(max_k)[None, :] < ks
+        ks = torch.tensor(top_ks, device=_DEVICE).reshape(rows, 1)
+        valid = torch.arange(max_k, device=_DEVICE)[None, :] < ks
         probs = _normalize_sparse_topk_probs(
-            topk_logits, temps, valid, torch.full((rows, 1), top_p), lse
+            topk_logits, temps, valid, torch.full((rows, 1), top_p, device=_DEVICE), lse
         )
-        dense = torch.zeros(rows, self.vocab, dtype=probs.dtype).scatter_(1, topk_ids, probs)
+        dense = torch.zeros(rows, self.vocab, dtype=probs.dtype, device=_DEVICE).scatter_(1, topk_ids, probs)
         return dense
 
     def test_sparse_matches_joint_reference(self):
@@ -95,14 +103,14 @@ class TestUnoJointTopkTopp(CustomTestCase):
     def test_dense_path_matches_joint_reference(self):
         rows, width = self.logits.shape[0], 2
         batch = rows // width
-        top_ks = torch.full((batch,), 200, dtype=torch.int32)
+        top_ks = torch.full((batch,), 200, dtype=torch.int32, device=_DEVICE)
         top_ks[::3] = 40
         sampling_info = SimpleNamespace(
             need_top_k_sampling=True,
             need_top_p_sampling=True,
-            temperatures=torch.ones(batch, 1),
+            temperatures=torch.ones(batch, 1, device=_DEVICE),
             top_ks=top_ks,
-            top_ps=torch.full((batch,), 0.9),
+            top_ps=torch.full((batch,), 0.9, device=_DEVICE),
         )
         out = _build_dense_probs(
             next_token_logits=self.logits,
@@ -115,6 +123,68 @@ class TestUnoJointTopkTopp(CustomTestCase):
         for i in range(rows):
             ref = joint_reference(self.logits[i], 1.0, int(top_ks[i // width]), 0.9)
             torch.testing.assert_close(out[i].double(), ref, atol=2e-6, rtol=0)
+
+    def test_tie_at_the_nucleus_edge_keeps_both_tokens(self):
+        # Tokens 6 and 7 have the same logit. 0.93 of the mass is strictly above them, so the
+        # nucleus keeps both (0.93 < 0.95); a cumulative sum over the sorted order would see 0.955
+        # before the second one and drop it.
+        head = torch.tensor([0.5, 0.2, 0.1, 0.06, 0.04, 0.03, 0.025, 0.025], dtype=torch.float64)
+        tail = torch.full((self.vocab - head.numel(),), 0.02 / (self.vocab - head.numel()), dtype=torch.float64)
+        logits = torch.log(torch.cat([head, tail])).float().to(_DEVICE)
+        logits[7] = logits[6]
+        rows = 1
+        topk_logits, topk_ids = torch.topk(logits[None], 20, dim=-1)
+        temps = torch.ones(rows, 1, device=_DEVICE)
+        lse = torch.logsumexp(logits[None], dim=-1, keepdim=True)
+        probs = _normalize_sparse_topk_probs(
+            topk_logits, temps, torch.ones_like(topk_logits, dtype=torch.bool),
+            torch.full((rows, 1), 0.95, device=_DEVICE), lse,
+        )
+        dense = torch.zeros(rows, self.vocab, device=_DEVICE).scatter_(1, topk_ids, probs)[0]
+        self.assertGreater(dense[6].item(), 0.0)
+        self.assertEqual(dense[6].item(), dense[7].item())
+        self.assertEqual(int((dense > 0).sum()), 8)
+        torch.testing.assert_close(dense.double(), joint_reference(logits, 1.0, 20, 0.95), atol=2e-6, rtol=0)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "flashinfer sampling kernels need CUDA")
+    def test_sparse_support_matches_flashinfer_on_bf16_ties(self):
+        # bf16-rounded logits tie often, like real model logits. The compact sparse support must keep
+        # exactly the tokens flashinfer's joint top-k / top-p (the dense path and the AR sampler) keeps.
+        torch.manual_seed(1)
+        rows, vocab = 64, 512
+        logits = (torch.randn(rows, vocab, device=_DEVICE) * 2.0).to(torch.bfloat16).float()
+        checked = with_tie = 0
+        for top_k in (20, 40):
+            for top_p in (0.8, 0.9, 0.95):
+                topk_logits, topk_ids = torch.topk(logits, top_k + 1, dim=-1)
+                # A tie straddling the k-th rank is the documented gap (flashinfer keeps every tied token).
+                usable = topk_logits[:, top_k - 1] != topk_logits[:, top_k]
+                topk_logits, topk_ids = topk_logits[:, :top_k], topk_ids[:, :top_k]
+                lse = torch.logsumexp(logits, dim=-1, keepdim=True)
+                sparse = _normalize_sparse_topk_probs(
+                    topk_logits, torch.ones(rows, 1, device=_DEVICE), torch.ones_like(topk_logits, dtype=torch.bool),
+                    torch.full((rows, 1), top_p, device=_DEVICE), lse,
+                )
+                sparse = torch.zeros(rows, vocab, device=_DEVICE).scatter_(1, topk_ids, sparse)
+                info = SimpleNamespace(
+                    need_top_k_sampling=True, need_top_p_sampling=True,
+                    temperatures=torch.ones(rows, 1, device=_DEVICE),
+                    top_ks=torch.full((rows,), top_k, dtype=torch.int32, device=_DEVICE),
+                    top_ps=torch.full((rows,), top_p, device=_DEVICE),
+                )
+                dense = _build_dense_probs(
+                    next_token_logits=logits, sampling_info=info, batch_size=rows, forward_width=1,
+                    max_top_k=top_k, uniform_top_k_value=None,
+                ).reshape(rows, vocab)
+                for r in usable.nonzero().flatten().tolist():
+                    kept = sparse[r] > 0
+                    self.assertTrue(torch.equal(kept, dense[r] > 0), f"row {r} top_k {top_k} top_p {top_p}")
+                    torch.testing.assert_close(sparse[r], dense[r], atol=1e-5, rtol=1e-4)
+                    vals = logits[r][kept]
+                    with_tie += int(vals.unique().numel() < vals.numel())
+                    checked += 1
+        self.assertGreater(checked, 200)
+        self.assertGreater(with_tie, 0)
 
 
 if __name__ == "__main__":

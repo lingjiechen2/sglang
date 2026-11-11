@@ -37,11 +37,18 @@ def _normalize_sparse_topk_probs(
     top-k tokens is the exact nucleus cumulative. Renormalizing the top-k support before the
     nucleus cut (top-k first) would shrink the nucleus whenever the top-k set holds less than
     all of the mass, and the target would no longer be the AR distribution.
+
+    A token is kept when the mass of the tokens strictly more likely than it is below top_p, which
+    is flashinfer's rule: tokens with equal probability (exact bf16 logit ties are common) are kept
+    or dropped together. A cumulative sum over the sorted order would count a tied partner placed
+    earlier and drop the later one. Not covered: a tie straddling the k-th rank, where flashinfer
+    keeps every tied token but the compact support holds at most k of them.
     """
     scaled = topk_logits.float() / temperatures
     full = torch.exp(scaled - log_normalizer)
-    cdf = torch.cumsum(full, dim=-1)
-    keep = valid & ((cdf - full) <= top_ps)
+    larger = full.unsqueeze(-2) > full.unsqueeze(-1)  # [..., i, j]: token j strictly above token i
+    mass_above = (full.unsqueeze(-2) * larger).sum(dim=-1)
+    keep = valid & (mass_above < top_ps)
     probs = torch.where(keep, full, torch.zeros_like(full))
     return probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
 
