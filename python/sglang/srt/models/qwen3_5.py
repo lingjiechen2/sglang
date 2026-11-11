@@ -924,8 +924,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             out = self.in_proj_qkvz.lora_backend.run_uno_fused_lora(
                 fused, hidden_states
             )
-        else:
+        elif os.environ.get("UNO_FUSED_BASE_CONCAT") == "1":
             out = fused.base_forward(hidden_states)
+        else:
+            # Base-only rows (prefill, target verify) run the same two GEMMs as the unfused path, so
+            # their results match the AR model bit for bit. The single concatenated GEMM rounds
+            # differently (TV ~2% on the first token); set UNO_FUSED_BASE_CONCAT=1 to use it.
+            projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
+            projected_states_ba, _ = self.in_proj_ba(hidden_states)
+            return projected_states_qkvz, projected_states_ba
         qkvz_width = fused.out_splits[0]
         return out[:, :qkvz_width], out[:, qkvz_width:]
 
