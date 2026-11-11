@@ -10,6 +10,7 @@ import torch
 
 from sglang.srt.speculative.uno_utils import (
     _build_dense_probs,
+    _build_sparse_target_support_tensors,
     _normalize_sparse_topk_probs,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -23,13 +24,14 @@ _DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 def joint_reference(logits, temperature, top_k, top_p):
     """Top-p nucleus of the full distribution intersected with the top-k set, renormalized.
 
-    flashinfer's rule: keep a token when the mass of the tokens strictly more likely than it is
-    below top_p, so tied tokens share one decision."""
+    flashinfer's rule: keep a token when fewer than top_k tokens are strictly more likely and the
+    mass of the tokens strictly more likely is below top_p, so tied tokens share one decision."""
     probs = torch.softmax(logits.double() / temperature, dim=-1)
     order = torch.argsort(probs, descending=True)
     sorted_probs = probs[order]
-    mass_above = (sorted_probs[None, :] * (sorted_probs[None, :] > sorted_probs[:, None])).sum(-1)
-    keep_sorted = (mass_above < top_p) & (torch.arange(len(order), device=probs.device) < top_k)
+    above = sorted_probs[None, :] > sorted_probs[:, None]
+    mass_above = (sorted_probs[None, :] * above).sum(-1)
+    keep_sorted = (mass_above < top_p) & (above.sum(-1) < top_k)
     out = torch.zeros_like(probs)
     out[order[keep_sorted]] = probs[order[keep_sorted]]
     return out / out.sum()
@@ -153,19 +155,15 @@ class TestUnoJointTopkTopp(CustomTestCase):
         torch.manual_seed(1)
         rows, vocab = 64, 512
         logits = (torch.randn(rows, vocab, device=_DEVICE) * 2.0).to(torch.bfloat16).float()
-        checked = with_tie = 0
+        checked = edge_tie = k_tie = 0
         for top_k in (20, 40):
-            for top_p in (0.8, 0.9, 0.95):
-                topk_logits, topk_ids = torch.topk(logits, top_k + 1, dim=-1)
-                # A tie straddling the k-th rank is the documented gap (flashinfer keeps every tied token).
-                usable = topk_logits[:, top_k - 1] != topk_logits[:, top_k]
-                topk_logits, topk_ids = topk_logits[:, :top_k], topk_ids[:, :top_k]
-                lse = torch.logsumexp(logits, dim=-1, keepdim=True)
-                sparse = _normalize_sparse_topk_probs(
-                    topk_logits, torch.ones(rows, 1, device=_DEVICE), torch.ones_like(topk_logits, dtype=torch.bool),
-                    torch.full((rows, 1), top_p, device=_DEVICE), lse,
+            for top_p in (0.8, 0.9, 0.95, 1.0):
+                ids, probs = _build_sparse_target_support_tensors(
+                    logits, torch.ones(rows, 1, device=_DEVICE),
+                    torch.full((rows,), top_k, dtype=torch.int32, device=_DEVICE),
+                    torch.full((rows,), top_p, device=_DEVICE), rows, 1, top_k,
                 )
-                sparse = torch.zeros(rows, vocab, device=_DEVICE).scatter_(1, topk_ids, sparse)
+                sparse = torch.zeros(rows, vocab, device=_DEVICE).scatter_(1, ids.reshape(rows, -1), probs.reshape(rows, -1))
                 info = SimpleNamespace(
                     need_top_k_sampling=True, need_top_p_sampling=True,
                     temperatures=torch.ones(rows, 1, device=_DEVICE),
@@ -176,15 +174,18 @@ class TestUnoJointTopkTopp(CustomTestCase):
                     next_token_logits=logits, sampling_info=info, batch_size=rows, forward_width=1,
                     max_top_k=top_k, uniform_top_k_value=None,
                 ).reshape(rows, vocab)
-                for r in usable.nonzero().flatten().tolist():
+                for r in range(rows):
                     kept = sparse[r] > 0
                     self.assertTrue(torch.equal(kept, dense[r] > 0), f"row {r} top_k {top_k} top_p {top_p}")
                     torch.testing.assert_close(sparse[r], dense[r], atol=1e-5, rtol=1e-4)
-                    vals = logits[r][kept]
-                    with_tie += int(vals.unique().numel() < vals.numel())
+                    torch.testing.assert_close(sparse[r].double(), joint_reference(logits[r], 1.0, top_k, top_p), atol=2e-6, rtol=0)
+                    last = logits[r][kept].min()
+                    edge_tie += int((logits[r][kept] == last).sum() > 1)
+                    k_tie += int(kept.sum() > top_k)
                     checked += 1
-        self.assertGreater(checked, 200)
-        self.assertGreater(with_tie, 0)
+        self.assertGreater(edge_tie, 0)  # ties at the kept edge occurred
+        self.assertGreater(k_tie, 0)  # ... and some straddled the k-th rank (support wider than k)
+        self.assertEqual(checked, rows * 8)
 
 
 if __name__ == "__main__":

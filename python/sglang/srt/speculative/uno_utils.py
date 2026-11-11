@@ -19,6 +19,8 @@ from sglang.srt.speculative.spec_utils import fast_sample
 from sglang.srt.speculative.uno_rectifier import UnoRectifier
 
 _SPARSE_TOP_K_LIMIT = 128
+# Extra candidates fetched beyond top_k so that tokens tied with the k-th one stay in the support.
+_SPARSE_TIE_PAD = 8
 
 
 def _normalize_sparse_topk_probs(
@@ -41,8 +43,8 @@ def _normalize_sparse_topk_probs(
     A token is kept when the mass of the tokens strictly more likely than it is below top_p, which
     is flashinfer's rule: tokens with equal probability (exact bf16 logit ties are common) are kept
     or dropped together. A cumulative sum over the sorted order would count a tied partner placed
-    earlier and drop the later one. Not covered: a tie straddling the k-th rank, where flashinfer
-    keeps every tied token but the compact support holds at most k of them.
+    earlier and drop the later one. ``valid`` carries the top-k rule; the caller
+    (``_build_sparse_target_support_tensors``) also keeps tokens tied with the k-th one.
     """
     scaled = topk_logits.float() / temperatures
     full = torch.exp(scaled - log_normalizer)
@@ -154,11 +156,17 @@ def _build_sparse_target_support_tensors(
     forward_width: int,
     max_top_k: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build compact support using the fastest available top-k primitive."""
+    """Build compact support using the fastest available top-k primitive.
+
+    The support holds ``max_top_k + _SPARSE_TIE_PAD`` candidates and keeps a token when fewer than
+    top_k tokens are strictly more likely, which is flashinfer's top-k rule: a tie straddling the
+    k-th rank keeps every tied token (up to the pad), as the AR sampler does.
+    """
     rows = batch_size * forward_width
+    support_width = min(max_top_k + _SPARSE_TIE_PAD, next_token_logits.shape[-1])
     topk_logits, topk_ids = _flashinfer_top_k(
         next_token_logits.contiguous(),
-        max_top_k,
+        support_width,
         sorted=True,
         deterministic=False,
     )
@@ -178,24 +186,21 @@ def _build_sparse_target_support_tensors(
         forward_width,
         dim=0,
     ).reshape(rows, 1)
-    ranks = torch.arange(
-        max_top_k,
-        dtype=expanded_top_ks.dtype,
-        device=next_token_logits.device,
-    )[None, :]
+    # Number of candidates strictly above each one (temperature > 0 keeps the order of the logits).
+    count_above = (topk_logits.unsqueeze(-2) > topk_logits.unsqueeze(-1)).sum(dim=-1)
     log_normalizer = torch.logsumexp(
         next_token_logits.float() / expanded_temperatures, dim=-1, keepdim=True
     )
     probs = _normalize_sparse_topk_probs(
         topk_logits,
         expanded_temperatures,
-        ranks < expanded_top_ks,
+        count_above < expanded_top_ks,
         expanded_top_ps,
         log_normalizer,
     )
     return (
-        topk_ids.view(batch_size, forward_width, max_top_k),
-        probs.view(batch_size, forward_width, max_top_k),
+        topk_ids.view(batch_size, forward_width, support_width),
+        probs.view(batch_size, forward_width, support_width),
     )
 
 
