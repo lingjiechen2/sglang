@@ -52,14 +52,21 @@ def _sampling_info(temperatures, top_ks, top_ps):
 
 
 def _full_vocab_rectified_q(logits, bias, temperature, top_k, top_p):
-    """DSpark's full-vocabulary rectified logits under UNO's target truncation."""
+    """DSpark's full-vocabulary rectified logits, truncated as the rectifier kernel does:
+    renormalize the top-k set, then cut the nucleus on it (top-k first). The draft q only has to
+    be the distribution the drafts are sampled from, so it need not use the target's joint support."""
     scores, order = torch.sort(logits + bias, descending=True)
     ranks = torch.arange(scores.numel(), device=scores.device)
+    valid = (ranks < top_k)[None]
+    scaled = scores[None].float() / temperature
+    # Normalizing over the top-k set only gives the top-k-first semantics.
+    top_k_lse = torch.logsumexp(scaled.masked_fill(~valid, float("-inf")), dim=-1, keepdim=True)
     probs = _normalize_sparse_topk_probs(
         scores[None],
         torch.tensor([[temperature]], device=scores.device),
-        (ranks < top_k)[None],
+        valid,
         torch.tensor([[top_p]], device=scores.device),
+        top_k_lse,
     )[0]
     return torch.zeros_like(probs).scatter_(0, order, probs)
 
