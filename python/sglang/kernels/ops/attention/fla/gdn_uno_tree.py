@@ -511,8 +511,11 @@ def _uno_tree_gdn_commit_kernel(
     path,  # [B, P] accepted nodes in order, root first
     stride_path,
     path_lens,  # [B]
+    track_slots,  # [B] slot that also receives the state after path step track_steps[b]
+    track_steps,  # [B] 0-based path index, -1 = none
     SEED_NODE: tl.constexpr,
     HAS_SEED: tl.constexpr,
+    HAS_TRACK: tl.constexpr,
     NODE_STRIDE: tl.constexpr,
     H: tl.constexpr,
     HV: tl.constexpr,
@@ -540,6 +543,13 @@ def _uno_tree_gdn_commit_kernel(
             n_steps = n + 1
         else:
             n_steps = n
+        track_s = -1
+        track_slot = slot
+        if HAS_TRACK:
+            track_slot = tl.load(track_slots + i_b).to(tl.int64)
+            track_step = tl.load(track_steps + i_b)
+            if (track_slot >= 0) & (track_step >= 0):
+                track_s = track_step + (1 if HAS_SEED else 0)
         for s in range(0, n_steps):
             if HAS_SEED:
                 node = tl.load(path + i_b * stride_path + tl.maximum(s - 1, 0)).to(tl.int64)
@@ -556,6 +566,9 @@ def _uno_tree_gdn_commit_kernel(
             b_v -= tl.sum(h * b_k[:, None], 0)
             b_v *= b_beta
             h += b_k[:, None] * b_v[None, :]
+            if s == track_s:
+                # Prefix-cache snapshot: the state on the track boundary, on the way.
+                tl.store(p_h + (track_slot - slot) * stride_state_slot, h)
         tl.store(p_h, h)
 
 
@@ -572,8 +585,12 @@ def uno_tree_gdn_commit(
     node_stride: int,
     num_k_heads: int,
     seed_node: Optional[int] = None,
+    track_slots: Optional[torch.Tensor] = None,  # [B]
+    track_steps: Optional[torch.Tensor] = None,  # [B] 0-based path index, -1 = none
 ) -> None:
-    """``seed_node``: replay that saved node before the path (merged seed)."""
+    """``seed_node``: replay that saved node before the path (merged seed).
+    ``track_slots`` / ``track_steps``: also store the state after that path step
+    into that slot (prefix-cache snapshot); no extra replay work."""
     layers, _, num_v_heads, head_v_dim, head_k_dim = state.shape
     batch = state_indices.shape[0]
     if batch == 0:
@@ -587,8 +604,11 @@ def uno_tree_gdn_commit(
         saved_k.stride(0), saved_v.stride(0), saved_g.stride(0),
         state_indices, save_rows,
         path, path.stride(0), path_lens,
+        track_slots if track_slots is not None else state_indices,
+        track_steps if track_steps is not None else path_lens,
         SEED_NODE=seed_node if seed_node is not None else 0,
         HAS_SEED=seed_node is not None,
+        HAS_TRACK=track_slots is not None,
         NODE_STRIDE=node_stride,
         H=num_k_heads,
         HV=num_v_heads,

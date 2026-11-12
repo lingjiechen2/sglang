@@ -270,6 +270,32 @@ class TestUnoTreeGdn(CustomTestCase):
         expected = tree_states[torch.arange(batch, device=_DEVICE), last]
         torch.testing.assert_close(committed[cache_indices.long()], expected, rtol=1e-4, atol=1e-4)
 
+        # Same commit, also snapshotting the state after path step j into a spare slot
+        # (prefix-cache track). The live state must not change, and the snapshot must be
+        # bit-identical to replaying only the first j + 1 path nodes.
+        steps = torch.stack([torch.randint(0, int(n), ()) for n in lens.tolist()]).to(_DEVICE)
+        steps[0] = -1  # no snapshot for this request
+        spare = torch.arange(slots, slots + batch, device=_DEVICE, dtype=torch.int32)
+        tracked = torch.cat([state, torch.zeros(batch, HV, V, K, device=_DEVICE)])
+        uno_tree_gdn_commit(tracked.unsqueeze(0), saved["saved_k"], saved["saved_v"],
+                            saved["saved_g"], saved["saved_beta"], cache_indices, rows,
+                            path, lens, node_stride=node_stride, num_k_heads=H, seed_node=offset,
+                            track_slots=spare, track_steps=steps.to(torch.int32))
+        torch.testing.assert_close(tracked[cache_indices.long()], committed[cache_indices.long()], rtol=0, atol=0)
+        prefix = state.clone()
+        uno_tree_gdn_commit(prefix.unsqueeze(0), saved["saved_k"], saved["saved_v"],
+                            saved["saved_g"], saved["saved_beta"], cache_indices, rows,
+                            path, (steps + 1).clamp_min(1).to(lens.dtype), node_stride=node_stride,
+                            num_k_heads=H, seed_node=offset)
+        for bi in range(batch):
+            snap = tracked[slots + bi]
+            if int(steps[bi]) < 0:
+                self.assertEqual(int(snap.abs().sum()), 0)
+            else:
+                torch.testing.assert_close(snap, prefix[int(cache_indices[bi])], rtol=0, atol=0)
+                node = int(path[bi, int(steps[bi])])
+                torch.testing.assert_close(snap, tree_states[bi, node], rtol=1e-4, atol=1e-4)
+
     def test_tree_q16(self):
         self._case(batch=3, num_nodes=16, chain=False, seed=0)
 
