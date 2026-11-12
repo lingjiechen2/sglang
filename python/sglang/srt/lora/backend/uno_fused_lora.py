@@ -11,7 +11,7 @@ their inputs and results are unchanged.
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 import msgspec
 import torch
@@ -166,6 +166,15 @@ class UnoFusedLoRA(msgspec.Struct, frozen=True):
     out_splits: tuple[int, ...] = ()
     # LoRA-A block of the gate and up slices, for a folded gate_up layer.
     gate_up_blocks: tuple[int, ...] = ()
+    # Optional quantized copy of weight_cat read by draft forwards only
+    # (--uno-draft-weight-quant; see speculative/uno_draft_quant.py).
+    draft_weight: Any = None
+
+    def _draft_gemm(self, x: torch.Tensor) -> torch.Tensor:
+        # Row count is fixed per captured graph, so this choice is static per graph.
+        if self.draft_weight is not None and x.shape[0] <= self.draft_weight.max_rows:
+            return self.draft_weight(x)
+        return torch.mm(x, self.weight_cat.t())
 
     def base_forward(self, x: torch.Tensor) -> torch.Tensor:
         """The folded layers' base outputs only (no LoRA), as one GEMM."""
@@ -173,7 +182,7 @@ class UnoFusedLoRA(msgspec.Struct, frozen=True):
 
     def forward_silu_mul(self, x: torch.Tensor, *, forward_width: int) -> torch.Tensor:
         """silu(gate) * up of a folded two-slice gate_up layer, in one pass."""
-        full = torch.mm(x, self.weight_cat.t())
+        full = self._draft_gemm(x)
         rows = full.shape[0]
         inter = self.out_features // 2
         out = torch.empty((rows, inter), dtype=full.dtype, device=full.device)
@@ -203,7 +212,7 @@ class UnoFusedLoRA(msgspec.Struct, frozen=True):
         return out
 
     def forward(self, x: torch.Tensor, *, forward_width: int) -> torch.Tensor:
-        full = torch.mm(x, self.weight_cat.t())
+        full = self._draft_gemm(x)
         rows = full.shape[0]
         out = torch.empty((rows, self.out_features), dtype=full.dtype, device=full.device)
         # Measured on H200 with Qwen3.8-27B layer shapes (rank 128).

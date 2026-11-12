@@ -48,6 +48,7 @@ def _causal_conv1d_linear_verify_kernel(
     SILU: tl.constexpr,
     BLOCK_C: tl.constexpr,
     USE_GDC: tl.constexpr = False,
+    UPDATE_STATE: tl.constexpr = True,
 ):
     if USE_GDC:
         # Programmatic dependent launch: start while the producer GEMM drains.
@@ -136,16 +137,17 @@ def _causal_conv1d_linear_verify_kernel(
     # Only after the outputs read the old state: like causal_conv1d_update,
     # leave conv_state at the state after all F tokens (s[F .. F + WIDTH - 2]);
     # the speculative commit then restores the accepted step's window.
-    state_pos = pos - F
-    state_mask = (pos >= F) & (pos <= F + WIDTH - 2)
-    tl.store(
-        conv_state
-        + state_slot * stride_cs_seq
-        + channels[:, None] * stride_cs_dim
-        + state_pos[None, :] * stride_cs_tok,
-        seq_vals.to(conv_state.dtype.element_ty),
-        mask=valid & c_mask[:, None] & state_mask[None, :],
-    )
+    if UPDATE_STATE:
+        state_pos = pos - F
+        state_mask = (pos >= F) & (pos <= F + WIDTH - 2)
+        tl.store(
+            conv_state
+            + state_slot * stride_cs_seq
+            + channels[:, None] * stride_cs_dim
+            + state_pos[None, :] * stride_cs_tok,
+            seq_vals.to(conv_state.dtype.element_ty),
+            mask=valid & c_mask[:, None] & state_mask[None, :],
+        )
 
 
 
@@ -164,7 +166,10 @@ def causal_conv1d_linear_verify(
     intermediate_conv_window: torch.Tensor,  # dedup view [slots, F, dim, width-1]
     intermediate_state_indices: torch.Tensor,  # [B]
     block_c: Optional[int] = None,
+    update_conv_state: bool = True,
 ) -> torch.Tensor:
+    """``update_conv_state=False`` leaves ``conv_state`` untouched (only the window
+    is written), for a pass whose state no commit follows before the next read."""
     batch, dim, F = x.shape
     if block_c is None:
         # Measured on H200 at dim 10240, F 8: small batches need more programs.
@@ -190,6 +195,7 @@ def causal_conv1d_linear_verify(
         HAS_BIAS=bias is not None,
         SILU=activation in ("silu", "swish"),
         BLOCK_C=block_c,
+        UPDATE_STATE=update_conv_state,
         num_warps=4,
         **({"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}),
     )
