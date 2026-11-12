@@ -43,6 +43,11 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.speculative.uno_cuda_graph_runner import (
     UnoDecodeCudaGraphRunner,
 )
+from sglang.srt.speculative.uno_draft_window import (
+    check_layers,
+    draft_window_from_env,
+    full_attention_backend,
+)
 from sglang.srt.speculative.uno_info import UnoDraftInput, UnoForwardInput
 from sglang.srt.speculative.uno_rectifier import UnoRectifier, load_uno_rectifier
 from sglang.srt.speculative.uno_tree import build_uno_tree_proposal
@@ -128,6 +133,13 @@ class UnoWorkerV2(BaseSpecWorker):
         # init_attention_backends(), after those pools exist.
         self._uno_draft_attn_backend = None
         self._uno_draft_cuda_graph_runner = None
+        # Draft-only KV window in tokens (opt-in env UNO_DRAFT_KV_WINDOW, 0 = off = unchanged behaviour). Linear UNO
+        # runs draft and verify on the same backend, so the window is switched on only around the draft pass (eager
+        # path) and baked into the draft ("lora") CUDA graph only (UnoDecodeCudaGraphRunner.capture_one_shape); tree
+        # UNO sets it once on its private draft backend.
+        # Optional layer selection (UNO_DRAFT_KV_WINDOW_LAYERS="0,2,4-34", 0-based): only these layers get the
+        # window; unset/empty = every layer.
+        self._uno_draft_window, self._uno_draft_window_layers = draft_window_from_env()
         self.plan_stream, self.plan_stream_ctx = (
             get_plan_stream(self.device)
             if self.tree_mode
@@ -201,6 +213,11 @@ class UnoWorkerV2(BaseSpecWorker):
 
         if self.tree_mode:
             self._uno_draft_attn_backend = self._build_uno_draft_attn_backend()
+            if self._uno_draft_window > 0:
+                # The private tree-draft backend never runs the verify pass, so the window can stay on.
+                full = self._draft_window_backend(self._uno_draft_attn_backend)
+                full.uno_draft_window = self._uno_draft_window
+                logger.info("UNO draft KV window: %d tokens (tree draft backend).", self._uno_draft_window)
         # Linear-attention layers keep a recurrent state that TARGET_VERIFY
         # never advances; UNO commits it after each of its two passes.
         self._commits_mamba_state = (
@@ -1041,6 +1058,31 @@ class UnoWorkerV2(BaseSpecWorker):
             self.model_runner.attn_backend = target_attn_backend
             self.model_runner.decode_cuda_graph_runner = target_graph_runner
 
+    def _draft_window_backend(self, backend):
+        """The FlashAttention backend carrying the window, with the validated layer selection set."""
+
+        full = full_attention_backend(backend)
+        check_layers(
+            self._uno_draft_window_layers,
+            int(self.model_runner.model_config.num_hidden_layers),
+        )
+        full.uno_draft_window_layers = self._uno_draft_window_layers
+        return full
+
+    @contextlib.contextmanager
+    def _linear_draft_window_context(self):
+        """Linear UNO: read only the recent keys during the draft pass, never during the verify pass."""
+
+        if self._uno_draft_window <= 0 or self.tree_mode:
+            yield
+            return
+        full = self._draft_window_backend(self.model_runner.attn_backend)
+        full.uno_draft_window = self._uno_draft_window
+        try:
+            yield
+        finally:
+            full.uno_draft_window = -1
+
     def _run_draft_block(
         self,
         forward_batch: ForwardBatch,
@@ -1062,7 +1104,7 @@ class UnoWorkerV2(BaseSpecWorker):
         # The eager runner plans through model_runner.attn_backend, while
         # attention layers execute through ForwardContext. Tree UNO binds both
         # to the same private F/1 backend for this draft pass.
-        with backend_context, attn_context:
+        with backend_context, attn_context, self._linear_draft_window_context():
             if self.num_speculative_proposals == 0:
                 return self._run_target_block(
                     forward_batch,
