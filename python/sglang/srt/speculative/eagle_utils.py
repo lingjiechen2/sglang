@@ -980,7 +980,28 @@ def eagle_sample(
             next_token_logits, temperatures=expanded_temperature
         )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
-        if sampling_info.need_top_k_sampling:
+        uno_joint = (
+            uno_target_max_top_k is not None
+            and sampling_info.need_top_k_sampling
+            and sampling_info.need_top_p_sampling
+        )
+        if uno_joint:
+            # UNO verifies against the AR sampler's joint top-k / top-p support: the top-p nucleus
+            # of the full distribution intersected with the top-k set. Renormalizing the top-k set
+            # before the nucleus cut (the sequential branch below) shrinks the nucleus.
+            from sglang.srt.speculative.uno_utils import joint_top_k_top_p_probs
+
+            target_probs = joint_top_k_top_p_probs(
+                target_probs,
+                torch.repeat_interleave(
+                    sampling_info.top_ks, verify_input.draft_token_num, dim=0
+                ),
+                torch.repeat_interleave(
+                    sampling_info.top_ps, verify_input.draft_token_num, dim=0
+                ),
+            )
+            maybe_detect_nan(target_probs, "v2 verify: target_probs after joint renorm")
+        elif sampling_info.need_top_k_sampling:
             target_probs = top_k_renorm_prob(
                 target_probs,
                 torch.repeat_interleave(
@@ -988,7 +1009,7 @@ def eagle_sample(
                 ),
             )  # (bs * num_draft_tokens, vocab_size)
             maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
-        if sampling_info.need_top_p_sampling:
+        if sampling_info.need_top_p_sampling and not uno_joint:
             target_probs = top_p_renorm_prob(
                 target_probs,
                 torch.repeat_interleave(

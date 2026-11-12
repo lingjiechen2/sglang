@@ -296,6 +296,20 @@ def _run_sparse_rejection(
     )
 
 
+def joint_top_k_top_p_probs(
+    probs: torch.Tensor, top_ks: torch.Tensor, top_ps: torch.Tensor
+) -> torch.Tensor:
+    """Dense distribution with the AR sampler's joint top-k / top-p support.
+
+    ``probs`` are full-vocabulary probabilities ``[rows, vocab]``. The result keeps the tokens that
+    are both in the top-k set and in the top-p nucleus of ``probs`` and renormalizes once. Cutting
+    the nucleus on the renormalized top-k set instead (top-k first) keeps fewer tokens.
+    """
+    nucleus = _dflash_top_p_renorm_prob(probs, top_ps)
+    joint = _dflash_top_k_renorm_prob(probs, top_ks).masked_fill_(nucleus <= 0, 0.0)
+    return joint.div_(joint.sum(dim=-1, keepdim=True))
+
+
 def _build_dense_probs(
     *,
     next_token_logits: torch.Tensor,
@@ -317,14 +331,11 @@ def _build_dense_probs(
             sampling_info.temperatures, forward_width, dim=0
         )
         probs = torch.softmax(next_token_logits / temperatures, dim=-1)
-        by_top_k = _dflash_top_k_renorm_prob(
-            probs, torch.repeat_interleave(sampling_info.top_ks, forward_width, dim=0)
+        joint = joint_top_k_top_p_probs(
+            probs,
+            torch.repeat_interleave(sampling_info.top_ks, forward_width, dim=0),
+            torch.repeat_interleave(sampling_info.top_ps, forward_width, dim=0),
         )
-        nucleus = _dflash_top_p_renorm_prob(
-            probs, torch.repeat_interleave(sampling_info.top_ps, forward_width, dim=0)
-        )
-        joint = by_top_k.masked_fill(nucleus <= 0, 0.0)
-        joint = joint / joint.sum(dim=-1, keepdim=True)
         return joint.view(batch_size, forward_width, -1).contiguous()
     return build_speculative_verify_target_probs(
         next_token_logits=next_token_logits,

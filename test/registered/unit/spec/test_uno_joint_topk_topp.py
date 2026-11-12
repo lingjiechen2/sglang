@@ -12,6 +12,7 @@ from sglang.srt.speculative.uno_utils import (
     _build_dense_probs,
     _build_sparse_target_support_tensors,
     _normalize_sparse_topk_probs,
+    joint_top_k_top_p_probs,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -125,6 +126,25 @@ class TestUnoJointTopkTopp(CustomTestCase):
         for i in range(rows):
             ref = joint_reference(self.logits[i], 1.0, int(top_ks[i // width]), 0.9)
             torch.testing.assert_close(out[i].double(), ref, atol=2e-6, rtol=0)
+
+    def test_tree_dense_joint_matches_reference_and_not_top_k_first(self):
+        # The tree verify's dense branch (eagle_sample) calls joint_top_k_top_p_probs for UNO. Rows
+        # mix top-k values the way a batch of top-k 20 and top-k off requests does.
+        rows = self.logits.shape[0]
+        probs = torch.softmax(self.logits.float(), dim=-1)
+        top_ks = torch.tensor([20, 200, self.vocab, 40] * (rows // 4), dtype=torch.int32, device=_DEVICE)
+        top_ps = torch.full((rows,), 0.95, device=_DEVICE)
+        got = joint_top_k_top_p_probs(probs, top_ks, top_ps)
+        sequential_tv = []
+        for i in range(rows):
+            ref = joint_reference(self.logits[i], 1.0, int(top_ks[i]), 0.95)
+            torch.testing.assert_close(got[i].double(), ref, atol=2e-6, rtol=0)
+            self.assertTrue(torch.equal(got[i] > 0, (ref > 0).to(got.device)))
+            first = top_k_first_reference(self.logits[i], 1.0, int(top_ks[i]), 0.95)
+            sequential_tv.append(0.5 * (ref - first).abs().sum().item())
+        # The sequential top-k then top-p order (the previous tree dense branch) is a different
+        # distribution on the flat rows.
+        self.assertGreater(max(sequential_tv), 0.01)
 
     def test_tie_at_the_nucleus_edge_keeps_both_tokens(self):
         # Tokens 6 and 7 have the same logit. 0.93 of the mass is strictly above them, so the
