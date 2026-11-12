@@ -22,6 +22,7 @@ def _make_request(**overrides):
         repetition_penalty=1.0,
         min_new_tokens=0,
         logit_bias=None,
+        sampling_seed=None,
     )
     request = SimpleNamespace(
         sampling_params=sampling_params,
@@ -80,6 +81,7 @@ class TestUnoRequestValidation(CustomTestCase):
                 "custom logit processors",
             ),
             "public LoRA": ({"request__lora_id": "adapter"}, "LoRA"),
+            "sampling seed": ({"sampling_params__sampling_seed": 7}, "sampling_seed"),
         }
 
         for name, (overrides, expected) in cases.items():

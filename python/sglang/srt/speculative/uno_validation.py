@@ -41,6 +41,11 @@ def validate_uno_request(req: Req) -> Optional[str]:
     if sampling_params.logit_bias is not None:
         return "UNO speculative decoding does not support logit_bias."
 
+    if getattr(sampling_params, "sampling_seed", None) is not None:
+        # UNO's draft sampling draws unseeded random numbers, so a seed would be
+        # accepted but not make the output reproducible.
+        return "UNO speculative decoding does not support sampling_seed."
+
     if req.custom_logit_processor:
         return "UNO speculative decoding does not support custom logit processors."
 

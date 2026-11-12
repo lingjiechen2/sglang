@@ -245,6 +245,14 @@ class UnoWorkerV2(BaseSpecWorker):
                 self.verify_width,
                 max_depth=self.forward_width - 1,
             )
+        if self._commits_mamba_state and get_exec().mamba.enable_mamba_extra_buffer:
+            log_info_on_rank0(
+                logger,
+                "UNO with the radix cache on a linear-attention model: speculative "
+                "verify states share the linear-attention state pool, so fewer "
+                "prefix snapshots stay cached than with AR. Raise "
+                "--max-mamba-cache-size to keep more of them.",
+            )
 
     def _commit_mamba_state(
         self,
