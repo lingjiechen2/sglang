@@ -250,6 +250,12 @@ class FlashAttentionBackend(AttentionBackend):
         # For each layer, the sliding_window_size can be different. This is only used for preparing SWA metadata.
         # We use `layer.sliding_window_size` to decide whether to use SWA for each layer.
         self.sliding_window_size = model_runner.sliding_window_size
+        # UNO draft-only KV window (opt-in via UNO_DRAFT_KV_WINDOW in the UNO worker): while > 0, the draft rows of
+        # the full-attention causal layers read only the most recent ``uno_draft_window`` keys. The UNO worker sets
+        # it for the draft pass and resets it to -1 before the verify pass. ``uno_draft_window_layers`` restricts
+        # the window to those layer ids (None = every layer).
+        self.uno_draft_window = -1
+        self.uno_draft_window_layers = None
         self.has_swa = (
             self.sliding_window_size is not None and self.sliding_window_size > -1
         )
@@ -1424,6 +1430,79 @@ class FlashAttentionBackend(AttentionBackend):
                 return None
         return (*buffers, locations)
 
+    def _uno_draft_window_applies(self, layer) -> bool:
+        layers = self.uno_draft_window_layers
+        return layers is None or int(layer.layer_id) in layers
+
+    def _uno_windowed_draft_attention(
+        self,
+        layer,
+        q,
+        key_cache,
+        value_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_k,
+        max_seqlen_q,
+        kwargs,
+    ):
+        """UNO draft pass with a KV window on the draft (mask) rows only.
+
+        Every request contributes ``rows`` consecutive query rows: row 0 is the clean seed token (base model), rows
+        1.. are the draft rows. The seed row's K/V stay in the cache after this pass (the verify pass starts one
+        position later), so it must see the full context, exactly like the clean rows of the training mask; only
+        the draft rows read the last ``uno_draft_window`` keys (key_pos >= query_pos - W). One attention call per
+        group because FlashAttention takes a single window per call.
+        """
+        rows = int(max_seqlen_q)
+        num_heads, head_dim = layer.tp_q_head_num, layer.head_dim
+        q3 = q.contiguous().view(-1, num_heads, head_dim)
+        bs = cache_seqlens.shape[0]
+        if rows < 2 or q3.shape[0] != bs * rows:
+            raise RuntimeError(
+                f"UNO draft window needs {rows} uniform rows per request, got {q3.shape[0]} rows for {bs} requests."
+            )
+        q4 = q3.view(bs, rows, num_heads, head_dim)
+        device = q3.device
+        common = dict(
+            k_cache=key_cache,
+            v_cache=value_cache,
+            page_table=page_table,
+            softmax_scale=layer.scaling,
+            causal=True,
+            softcap=layer.logit_cap,
+            num_splits=self.num_splits,
+            ver=self.fa_impl_ver,
+        )
+        seed_seqlens = (cache_seqlens - (rows - 1)).to(torch.int32)
+        seed_cu_k = torch.nn.functional.pad(torch.cumsum(seed_seqlens, 0, dtype=torch.int32), (1, 0))
+        out_seed = flash_attn_with_kvcache(
+            q=q4[:, 0].contiguous(),
+            cache_seqlens=seed_seqlens,
+            cu_seqlens_q=torch.arange(bs + 1, device=device, dtype=torch.int32),
+            cu_seqlens_k_new=seed_cu_k,
+            max_seqlen_q=1,
+            window_size=(-1, -1),
+            **common,
+            **kwargs,
+        )
+        out_draft = flash_attn_with_kvcache(
+            q=q4[:, 1:].reshape(bs * (rows - 1), num_heads, head_dim),
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=torch.arange(bs + 1, device=device, dtype=torch.int32) * (rows - 1),
+            cu_seqlens_k_new=cu_seqlens_k,
+            max_seqlen_q=rows - 1,
+            window_size=(self.uno_draft_window, 0),
+            **common,
+            **kwargs,
+        )
+        out = torch.empty(
+            (bs, rows, num_heads, out_seed.shape[-1]), dtype=out_seed.dtype, device=device
+        )
+        out[:, 0] = out_seed.view(bs, num_heads, -1)
+        out[:, 1:] = out_draft.view(bs, rows - 1, num_heads, -1)
+        return out.view(bs * rows, num_heads, -1)
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1735,6 +1814,26 @@ class FlashAttentionBackend(AttentionBackend):
                     num_splits=self.num_splits,
                     out=_fa_out,
                     **kwargs,
+                )
+            elif (
+                self.uno_draft_window > 0
+                and causal
+                and not is_swa_layer
+                and not use_cascade_attn
+                and not use_local_attn
+                and not return_lse
+                and self._uno_draft_window_applies(layer)
+            ):
+                result = self._uno_windowed_draft_attention(
+                    layer,
+                    q,
+                    key_cache,
+                    value_cache,
+                    page_table,
+                    cache_seqlens,
+                    cu_seqlens_k,
+                    max_seqlen_q,
+                    kwargs,
                 )
             else:
                 result = flash_attn_with_kvcache(
