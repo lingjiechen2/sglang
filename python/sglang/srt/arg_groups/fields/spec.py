@@ -55,6 +55,16 @@ class Spec(msgspec.Struct):
         "fused kernel per layer, instead of separate LoRA GEMMs. Changes only "
         "how draft forwards execute; base-only forwards are unchanged.",
     ] = False
+    uno_draft_weight_quant: A[
+        Literal["none", "bf16", "fp8", "int4"],
+        "Linear UNO with --uno-fused-lora: draft forwards read a weight-only "
+        "Marlin copy (fp8 per-channel or int4 group-128) of each folded [W; A] "
+        "weight. The seed row and the clean token then move into the bf16 verify "
+        "(both passes run --speculative-num-draft-tokens + 1 rows; the last draft "
+        "row is unused), so committed tokens still follow the target model. "
+        "'bf16' runs that verify layout with unquantized drafts. Default 'none' "
+        "keeps the regular UNO layout.",
+    ] = "none"
     uno_mova_lora: A[
         bool,
         "Apply the MoVA LoRA parts shipped next to the UNO LoRA "
