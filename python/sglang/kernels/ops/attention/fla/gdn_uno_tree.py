@@ -524,7 +524,7 @@ def _uno_tree_gdn_commit_kernel(
     i_b = tl.program_id(0).to(tl.int64)
     i_lh = tl.program_id(1)
     i_v = tl.program_id(2)
-    layer = i_lh // HV
+    layer = (i_lh // HV).to(tl.int64)  # layer * stride passes 2**31 on large state pools
     i_hv = i_lh % HV
     i_h = i_hv // (HV // H)
     slot = tl.load(state_indices + i_b).to(tl.int64)
