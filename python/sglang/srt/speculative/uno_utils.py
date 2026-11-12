@@ -505,6 +505,17 @@ def build_uno_draft_input(
     return draft_input_ids
 
 
+def uno_mamba_track_steps(
+    track_from: torch.Tensor, num_rows: torch.Tensor, interval: int
+) -> torch.Tensor:
+    """Row whose post-state is the prefix-cache track boundary crossed when
+    ``num_rows`` rows are committed after ``track_from`` tokens, else -1."""
+    boundary = (track_from + num_rows) // interval * interval
+    return torch.where(boundary > track_from, boundary - track_from - 1, -1).to(
+        torch.int64
+    )
+
+
 def extract_uno_recycle_tail(
     candidates: torch.Tensor,  # [B, F]
     accept_lens: torch.Tensor,  # [B]
