@@ -1,5 +1,6 @@
 """Contracts for UNO's MoVA value-expert LoRA."""
 
+import json
 import os
 import tempfile
 import unittest
@@ -7,6 +8,7 @@ from types import SimpleNamespace
 
 import torch
 import torch.nn.functional as F
+from safetensors.torch import save_file
 
 from sglang.srt.layers.mova import routed_linear_reference
 from sglang.srt.speculative.uno_mova_lora import (
@@ -63,8 +65,16 @@ class TestUnoMovaValueLoRA(CustomTestCase):
         out = lora(self.x, self.w, self.sel, self.weights, self.base)
         torch.testing.assert_close(out, self.base)
 
-    def test_attach_fails_without_mova_layers(self):
+    def test_value_expert_lora_fails_without_mova_layers(self):
+        # Dense/FFN-only adapters attach to any model; only value-expert tensors need MoVA attention.
         with tempfile.TemporaryDirectory() as path:
+            os.makedirs(os.path.join(path, "mova"))
+            save_file(
+                {f"model.layers.0.self_attn.v_experts.lora_{ab}.weight": torch.zeros(2, 2) for ab in "AB"},
+                os.path.join(path, "mova", "lora.safetensors"),
+            )
+            with open(os.path.join(path, "adapter_config.json"), "w") as f:
+                json.dump({"lora_alpha": 2, "r": 2}, f)
             with self.assertRaisesRegex(ValueError, "MoVA attention"):
                 attach_uno_mova_lora(SimpleNamespace(lora_backend=None), torch.nn.Linear(2, 2), path)
 
