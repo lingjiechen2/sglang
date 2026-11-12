@@ -245,15 +245,6 @@ class UnoWorkerV2(BaseSpecWorker):
                 self.verify_width,
                 max_depth=self.forward_width - 1,
             )
-        if (
-            self._commits_mamba_state
-            and self.tree_mode
-            and get_exec().mamba.enable_mamba_extra_buffer
-        ):
-            raise NotImplementedError(
-                "UNO tree mode on linear-attention models does not track "
-                "prefix-cache states yet; pass --disable-radix-cache."
-            )
 
     def _commit_mamba_state(
         self,
@@ -743,6 +734,8 @@ class UnoWorkerV2(BaseSpecWorker):
         # The first pass wrote the carried seed at C.  Give EAGLE a shallow
         # batch whose KV-ready prefix is therefore C+1; its existing allocator
         # assigns all Q tree slots at C+1 and its compactor can stay unchanged.
+        if self._commits_mamba_state:
+            prepare_mamba_track_for_verify(batch)  # no-op without extra_buffer
         verify_batch = copy.copy(batch)
         verify_batch.seq_lens = committed_seq_lens + 1
         if committed_seq_lens_cpu is None:

@@ -175,9 +175,13 @@ def commit_uno_tree_path(
     path: torch.Tensor,  # [B, P] local node ids, root first, -1 padded
     path_lens: torch.Tensor,  # [B]
     with_seed: bool = False,
+    track_slots: Optional[torch.Tensor] = None,  # [B]
+    track_steps: Optional[torch.Tensor] = None,  # [B] 0-based path index, -1 = none
 ) -> None:
     """Advance every request's GDN state and conv window along its path
-    (after the uncommitted draft seed when ``with_seed``)."""
+    (after the uncommitted draft seed when ``with_seed``). With ``track_slots``,
+    the state and conv window after path step ``track_steps`` are also written to
+    that slot (prefix-cache snapshot)."""
     state = get_uno_tree_gdn(req_to_token_pool)
     batch_size = path_lens.shape[0]
     if batch_size == 0:
@@ -200,11 +204,22 @@ def commit_uno_tree_path(
         node_stride=state.node_stride,
         num_k_heads=state.num_k_heads,
         seed_node=state.draft_offset if with_seed else None,
+        track_slots=track_slots,
+        track_steps=None if track_steps is None else track_steps.to(torch.int32),
     )
     last_nodes = path.gather(1, (path_lens.clamp_min(1) - 1).to(torch.int64)[:, None])[:, 0]
     last_nodes = torch.where(path_lens > 0, last_nodes, -1)
     src_rows = None if not pp_spec_stable_rows_enabled() else rows
+    track_nodes = None
+    if track_slots is not None:
+        step = track_steps.to(torch.int64)
+        track_nodes = path.gather(1, step.clamp_min(0)[:, None])[:, 0]
+        track_nodes = torch.where((step >= 0) & (track_slots >= 0), track_nodes, -1)
     for conv, window in zip(spec_state.conv, spec_state.intermediate_conv_window):
+        if track_nodes is not None:
+            fused_conv_window_scatter_with_mask(
+                conv, window, track_slots, track_nodes, src_rows
+            )
         fused_conv_window_scatter_with_mask(
             conv, window, state_indices, last_nodes, src_rows
         )
@@ -216,10 +231,18 @@ def commit_uno_tree_after_verify(
     accept_index: torch.Tensor,  # [B, P] flat node indices, -1 padded
     accept_lens: torch.Tensor,  # [B]
     num_nodes: int,
+    track_slots: Optional[torch.Tensor] = None,
+    track_steps: Optional[torch.Tensor] = None,
 ) -> None:
     batch_size = accept_lens.shape[0]
     offsets = torch.arange(batch_size, device=accept_index.device)[:, None] * num_nodes
     path = torch.where(accept_index >= 0, accept_index - offsets, -1)
     commit_uno_tree_path(
-        req_to_token_pool, req_pool_indices, path, accept_lens, with_seed=True
+        req_to_token_pool,
+        req_pool_indices,
+        path,
+        accept_lens,
+        with_seed=True,
+        track_slots=track_slots,
+        track_steps=track_steps,
     )

@@ -987,8 +987,26 @@ def commit_mamba_states_after_verify(
             return
         from sglang.srt.speculative.uno_tree_gdn import commit_uno_tree_after_verify
 
+        track_slots = track_steps = None
+        if batch.mamba_track_indices is not None:
+            # Prefix cache: the path step landing on a track boundary is also
+            # written to the track slot (the scheduler records the same crossing).
+            from sglang.srt.speculative.uno_utils import uno_mamba_track_steps
+
+            track_slots = batch.mamba_track_indices[:bs]
+            track_steps = uno_mamba_track_steps(
+                batch.seq_lens[:bs].to(torch.int64),
+                accept_lens.to(torch.int64),
+                mamba_track_grid(batch.tree_cache.page_size),
+            )
         commit_uno_tree_after_verify(
-            req_pool, batch.req_pool_indices, accept_index, accept_lens, draft_token_num
+            req_pool,
+            batch.req_pool_indices,
+            accept_index,
+            accept_lens,
+            draft_token_num,
+            track_slots=track_slots,
+            track_steps=track_steps,
         )
         return
 
