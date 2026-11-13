@@ -15,7 +15,7 @@ from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
     build_speculative_verify_target_probs,
 )
-from sglang.srt.speculative.spec_utils import fast_sample
+from sglang.srt.speculative.spec_utils import fast_sample, sample_simulated_acc_len
 from sglang.srt.speculative.uno_rectifier import UnoRectifier
 
 _SPARSE_TOP_K_LIMIT = 128
@@ -773,3 +773,34 @@ def run_uno_sampling(
         bonus_tokens=bonus,
         committed_frontiers=committed_frontiers,
     )
+
+
+def simulate_uno_acceptance(
+    *,
+    candidates: torch.Tensor,  # [B, F] verify inputs
+    next_token_logits: torch.Tensor,  # [B * F, V] verify logits
+    committed_seq_lens: torch.Tensor,  # [B]
+    simulate_acc_len: float,
+    simulate_acc_method: str,
+    simulate_acc_token_mode: str,
+    fixed_token_id: int = 100,
+) -> tuple:
+    """Force the tokens committed per round (SGLANG_SIMULATE_ACC_LEN benchmark knob), ignoring the verify result.
+
+    Returns what the real acceptance returns: (output_ids [B, F + 1], accept_lens, new_seq_lens, correction).
+    A linear round commits between 2 and F + 1 tokens. One length is drawn per round for the whole batch.
+    "real-draft-token" keeps the draft tokens and takes the target argmax as the next seed; "fixed" emits one token id.
+    """
+    batch_size, forward_width = candidates.shape
+    commit = sample_simulated_acc_len(simulate_acc_len, simulate_acc_method, forward_width + 1)
+    accepted = max(commit, 2) - 2  # verified drafts kept after verify row 0
+    output_ids = torch.zeros((batch_size, forward_width + 1), dtype=torch.int64, device=candidates.device)
+    if simulate_acc_token_mode == "real-draft-token":
+        correction = next_token_logits.view(batch_size, forward_width, -1)[:, accepted].argmax(dim=-1)
+        output_ids[:, :forward_width].copy_(candidates)
+        output_ids[:, accepted + 1].copy_(correction)
+    else:
+        correction = torch.full((batch_size,), fixed_token_id, dtype=torch.int64, device=candidates.device)
+        output_ids.fill_(fixed_token_id)
+    accept_lens = torch.full((batch_size,), accepted + 2, dtype=torch.int32, device=candidates.device)
+    return output_ids, accept_lens, committed_seq_lens + accept_lens.to(committed_seq_lens.dtype), correction

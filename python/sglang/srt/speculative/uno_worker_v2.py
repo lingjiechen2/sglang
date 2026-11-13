@@ -36,6 +36,9 @@ from sglang.srt.speculative.eagle_worker_common import (
 )
 from sglang.srt.speculative.spec_info import SpecInputType, SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
+    SIMULATE_ACC_LEN,
+    SIMULATE_ACC_METHOD,
+    SIMULATE_ACC_TOKEN_MODE,
     commit_mamba_states_after_verify,
     get_plan_stream,
     prepare_mamba_track_for_verify,
@@ -60,6 +63,7 @@ from sglang.srt.speculative.uno_utils import (
     run_uno_sampling,
     sample_uno_candidates,
     sample_uno_clean_root,
+    simulate_uno_acceptance,
     uno_mamba_track_steps,
 )
 from sglang.srt.utils.common import (
@@ -140,6 +144,8 @@ class UnoWorkerV2(BaseSpecWorker):
         # Optional layer selection (UNO_DRAFT_KV_WINDOW_LAYERS="0,2,4-34", 0-based): only these layers get the
         # window; unset/empty = every layer.
         self._uno_draft_window, self._uno_draft_window_layers = draft_window_from_env()
+        if SIMULATE_ACC_LEN > 0 and self.tree_mode:
+            raise NotImplementedError("SGLANG_SIMULATE_ACC_LEN supports linear UNO only.")
         self.plan_stream, self.plan_stream_ctx = (
             get_plan_stream(self.device)
             if self.tree_mode
@@ -985,6 +991,23 @@ class UnoWorkerV2(BaseSpecWorker):
             accept_lens = sampling_result.accept_lens
             new_seq_lens = sampling_result.new_seq_lens
             correction = sampling_result.next_seed_tokens
+            self._sync_tp(
+                output_ids=output_ids,
+                accept_lens=accept_lens,
+                new_seq_lens=new_seq_lens,
+                correction=correction,
+            )
+
+        if SIMULATE_ACC_LEN > 0:
+            # Benchmark knob: both passes and the real acceptance ran above; only the committed length is forced.
+            output_ids, accept_lens, new_seq_lens, correction = simulate_uno_acceptance(
+                candidates=candidates,
+                next_token_logits=verify_result.logits_output.next_token_logits,
+                committed_seq_lens=committed_seq_lens,
+                simulate_acc_len=SIMULATE_ACC_LEN,
+                simulate_acc_method=SIMULATE_ACC_METHOD,
+                simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
+            )
             self._sync_tp(
                 output_ids=output_ids,
                 accept_lens=accept_lens,
