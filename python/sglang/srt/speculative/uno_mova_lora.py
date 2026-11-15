@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 from collections import defaultdict
@@ -261,6 +262,147 @@ class _RowHook:
         return (out, *rest)
 
 
+FAST_PARTS = ("row", "gateup", "down")
+
+
+def fast_parts() -> set:
+    """``SGLANG_UNO_MOVA_LORA_FAST``: which draft-row LoRA paths use the fast kernels (default: none).
+
+    ``1``/``all`` = every path, or a comma list of ``row`` (dense / shared-expert forward hooks), ``gateup`` (routed
+    experts, before the activation) and ``down`` (routed experts, after the down GEMM)."""
+    value = os.environ.get("SGLANG_UNO_MOVA_LORA_FAST", "").strip().lower()
+    if value in ("", "0", "false", "off"):
+        return set()
+    if value in ("1", "all", "true", "on"):
+        return set(FAST_PARTS)
+    parts = {p.strip() for p in value.split(",") if p.strip()}
+    if parts - set(FAST_PARTS):
+        raise ValueError(f"SGLANG_UNO_MOVA_LORA_FAST: unknown parts {sorted(parts - set(FAST_PARTS))}, choose from {FAST_PARTS}.")
+    return parts
+
+
+def _draft_route(lora_backend, num_tokens: int):
+    route = getattr(lora_backend.batch_info, "uno_single_adapter_route", None)
+    if route is None:
+        return None
+    assert num_tokens == route.total_rows, (num_tokens, route.total_rows)
+    return route
+
+
+def _zero_seed_rows(act: torch.Tensor, route) -> torch.Tensor:
+    """Zero the seed row of every ``[seed, F - 1 draft rows]`` block of a rank activation, in place.
+
+    ``B @ 0`` is exactly zero, so adding the resulting delta to the full output leaves the seed rows bit-identical."""
+    act.view(route.batch_size, route.forward_width, -1)[:, 0].zero_()
+    return act
+
+
+class _PackedLoRA:
+    """LoRAs that read the same input and write adjacent output columns, run as one A GEMM and one B GEMM.
+
+    ``A`` is the row concatenation of the parts' A, ``B`` is block diagonal (the zero blocks add exact zeros), so the
+    packed delta covers the parts' columns in order. The LoRA scaling is folded into ``B`` when it is a power of two
+    (an exact multiply in bf16); otherwise it is applied to the delta."""
+
+    def __init__(self, parts, scaling: float):
+        self.a = torch.cat([a for a, _ in parts], 0).contiguous()
+        b_full = parts[0][1].new_zeros(sum(b.shape[0] for _, b in parts), sum(a.shape[0] for a, _ in parts))
+        row = col = 0
+        for a, b in parts:
+            b_full[row : row + b.shape[0], col : col + a.shape[0]] = b
+            row, col = row + b.shape[0], col + a.shape[0]
+        mantissa, _ = math.frexp(scaling)
+        self.post_scale = None if mantissa == 0.5 else scaling
+        self.b = (b_full * scaling if self.post_scale is None else b_full).contiguous()
+        self.width = row
+
+    def rank_act(self, x: torch.Tensor) -> torch.Tensor:
+        return F.linear(x, self.a)
+
+    def expand(self, act: torch.Tensor) -> torch.Tensor:
+        delta = F.linear(act, self.b)
+        return delta if self.post_scale is None else delta * self.post_scale
+
+    def delta(self, x: torch.Tensor, route) -> torch.Tensor:
+        """Delta for every row of ``x``, exactly zero on the seed rows."""
+        return self.expand(_zero_seed_rows(self.rank_act(x), route))
+
+
+class UnoMovaExpertLoRAFast(UnoMovaExpertLoRA):
+    """:class:`UnoMovaExpertLoRA` with the fast paths of :func:`fast_parts` (same math, fewer kernels).
+
+    * ``gateup``: gate and up deltas from one packed LoRA over all rows (seed rows exactly zero), broadcast-added over
+      the top-k slots in place, without row gathers or scatters.
+    * ``down``: the shared down LoRA is linear, so ``sum_k w_k B A h_k = B (sum_k w_k A h_k)``: one A GEMM over all
+      slots, a routing-weighted sum over top-k, one B GEMM per row, added to slot 0 only (the MoE sums the slots next).
+    """
+
+    def __init__(self, parts, scaling, lora_backend, fast: set):
+        super().__init__(parts, scaling, lora_backend)
+        self.fast_gate_up = None
+        if "gateup" in fast and "gate_proj" in parts and "up_proj" in parts:
+            self.fast_gate_up = _PackedLoRA([parts["gate_proj"], parts["up_proj"]], scaling)
+        self.fast_down = None
+        if "down" in fast and "down_proj" in parts:
+            self.fast_down = _PackedLoRA([parts["down_proj"]], scaling)
+
+    def __call__(self, hidden_states):
+        route = _draft_route(self.lora_backend, hidden_states.shape[0])
+        if route is None:
+            return None
+        from sglang.srt.lora.lora_moe_runners import LoRAHooks
+
+        rows = None
+        if self.fast_gate_up is None or (self.fast_down is None and "down_proj" in self.parts):
+            rows = draft_rows(self.lora_backend, hidden_states.shape[0], hidden_states.device)
+        gate_up = partial(self._fast_after_gate_up, route) if self.fast_gate_up is not None else partial(self.after_gate_up, rows)
+        down = partial(self._fast_after_down, route) if self.fast_down is not None else partial(self.after_down, rows)
+        return LoRAHooks(after_gate_up=gate_up, after_down=down)
+
+    def _fast_after_gate_up(self, route, hidden_states, gate_up, topk_weights, topk_ids):
+        delta = self.fast_gate_up.delta(hidden_states, route)
+        if delta.shape[-1] != gate_up.shape[-1]:
+            raise ValueError(f"UNO MoVA fast gate/up LoRA: delta width {delta.shape[-1]} vs gate_up {gate_up.shape[-1]}.")
+        gate_up.add_(delta.to(gate_up.dtype)[:, None, :])
+
+    def _fast_after_down(self, route, activated, down, topk_weights, topk_ids):
+        tokens, topk, _ = down.shape
+        act = self.fast_down.rank_act(activated[: tokens * topk]).view(tokens, topk, -1)
+        act = torch.bmm(topk_weights.to(act.dtype).view(tokens, 1, topk), act).view(tokens, -1)
+        delta = self.fast_down.expand(_zero_seed_rows(act, route))
+        down[:, 0, :].add_(delta.to(down.dtype))
+
+
+class _FastRowHook:
+    """Fast :class:`_RowHook` for parts that cover the whole output (no all-reduce): one packed LoRA over all rows,
+    seed rows exactly zero, added to the layer output in place (no clone, gather or scatter)."""
+
+    def __init__(self, parts, scaling, lora_backend):
+        self.packed = _PackedLoRA([(a, b) for _, _, a, b in parts], scaling)
+        self.lora_backend = lora_backend
+
+    def __call__(self, module, inputs, output):
+        x, out = inputs[0], output[0]
+        route = _draft_route(self.lora_backend, x.shape[0])
+        if route is None:
+            return None
+        delta = self.packed.delta(x, route)
+        if delta.shape[-1] != out.shape[-1]:
+            raise ValueError(f"UNO MoVA fast LoRA hook: delta width {delta.shape[-1]} vs output {out.shape[-1]}.")
+        out.add_(delta.to(out.dtype))
+        return None
+
+
+def _row_parts_cover_output(parts) -> bool:
+    """Parts sorted by column start that tile ``[0, end)`` without gaps."""
+    pos = 0
+    for start, end, _, _ in parts:
+        if start != pos:
+            return False
+        pos = end
+    return True
+
+
 def _attach_expert_lora(moe, lora: UnoMovaExpertLoRA) -> None:
     method = moe.quant_method
     runner = getattr(method, "runner", None)
@@ -369,15 +511,29 @@ def attach_uno_mova_lora(manager: LoRAManager, model: torch.nn.Module, lora_path
             start = 0 if proj == "gate_proj" else width
             hooks[(layer, f"{parent}.gate_up_proj")].append((start, start + width, a, b))
         attached += 1
+    fast = fast_parts()
+    fast_hooks = 0
     for (layer, name), parts in hooks.items():
         module = layers[layer].get_submodule(name)
         # A row-parallel layer with reduce_results has already summed its ranks: sum the delta's partials the same way.
         reduce = tp_group.all_reduce if tp_size > 1 and name.endswith("down_proj") and module.reduce_results else None
-        module.register_forward_hook(_RowHook(parts, scaling, backend, reduce))
+        parts = sorted(parts, key=lambda p: p[0])
+        if "row" in fast and reduce is None and _row_parts_cover_output(parts):
+            module.register_forward_hook(_FastRowHook(parts, scaling, backend))
+            fast_hooks += 1
+        else:
+            module.register_forward_hook(_RowHook(parts, scaling, backend, reduce))
     for layer, parts in experts.items():
         per_expert = {p[0].ndim == 3 for p in parts.values()}
         if len(per_expert) != 1:
             raise ValueError(f"Layer {layer}: routed experts LoRA mixes per-expert and shared projections.")
-        cls = UnoMovaPerExpertExpertLoRA if per_expert.pop() else UnoMovaExpertLoRA
-        _attach_expert_lora(layers[layer].mlp.experts, cls(parts, scaling, backend))
+        if per_expert.pop():
+            lora = UnoMovaPerExpertExpertLoRA(parts, scaling, backend)
+        elif fast & {"gateup", "down"}:
+            lora = UnoMovaExpertLoRAFast(parts, scaling, backend, fast)
+        else:
+            lora = UnoMovaExpertLoRA(parts, scaling, backend)
+        _attach_expert_lora(layers[layer].mlp.experts, lora)
     logger.info("UNO MoVA LoRA: %d adapters on %d layers (scaling %.1f).", attached, len(layers), scaling)
+    if fast:
+        logger.info("UNO MoVA LoRA fast paths %s: %d/%d forward hooks fast.", sorted(fast), fast_hooks, len(hooks))
