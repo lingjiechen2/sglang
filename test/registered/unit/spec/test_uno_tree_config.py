@@ -37,6 +37,34 @@ class TestUnoTreeConfig(CustomTestCase):
         ):
             _handle_uno(server_args)
 
+    def test_quantized_tree_needs_a_node_for_the_seed_root(self):
+        """Quantized tree drafts verify the seed as the root: Q >= F + 1."""
+
+        server_args = SimpleNamespace(
+            device="cuda",
+            enable_deterministic_inference=False,
+            enable_strict_thinking=False,
+            speculative_draft_model_path=None,
+            uno_lora_path="/tmp/uno-lora",
+            speculative_num_draft_tokens=8,
+            speculative_num_steps=7,
+            speculative_eagle_topk=4,
+            uno_draft_weight_quant="int4",
+            uno_fused_lora=True,
+            uno_enable_recycle=False,
+            uno_mova_lora=False,
+        )
+
+        with (
+            patch(
+                "sglang.srt.arg_groups.speculative_hook.resolving_view",
+                side_effect=lambda args: args,
+            ),
+            patch("sglang.srt.arg_groups.speculative_hook.declare_resolution"),
+            self.assertRaisesRegex(ValueError, "Q >= F \\+ 1"),
+        ):
+            _handle_uno(server_args)
+
 
 if __name__ == "__main__":
     unittest.main()

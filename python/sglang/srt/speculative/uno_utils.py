@@ -658,9 +658,19 @@ def _sample_rectified_candidates(
     )
     if sparse:
         if include_clean:
+            # The clean support carries the tie pad, the rectifier lattice does not; pad the
+            # narrower one with q = 0 columns (q lookups sum over matching ids, so this is exact).
+            draft_ids, draft_probs = rectified.candidates, rectified.probs
+            pad = clean_ids.shape[-1] - draft_ids.shape[-1]
+            if pad > 0:
+                draft_ids = torch.nn.functional.pad(draft_ids, (0, pad))
+                draft_probs = torch.nn.functional.pad(draft_probs, (0, pad))
+            elif pad < 0:
+                clean_ids = torch.nn.functional.pad(clean_ids, (0, -pad))
+                clean_probs = torch.nn.functional.pad(clean_probs, (0, -pad))
             return candidates, UnoDraftDistribution(
-                token_ids=torch.cat((clean_ids, rectified.candidates), dim=1),
-                probs=torch.cat((clean_probs.float(), rectified.probs), dim=1),
+                token_ids=torch.cat((clean_ids, draft_ids), dim=1),
+                probs=torch.cat((clean_probs.float(), draft_probs), dim=1),
             )
         return candidates, UnoDraftDistribution(
             token_ids=rectified.candidates,
@@ -720,8 +730,12 @@ def sample_uno_tree_target_tokens(
     batch_size: int,
     verify_width: int,
     max_top_k: int,
+    root_noise: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Sample one target token per verify node from compact top-k support."""
+    """Sample one target token per verify node from compact top-k support.
+
+    ``root_noise`` [B, V] (Gumbel): the root's token is argmax(log p + G) over its
+    support, an exact sample of p coupled with the draft's first-level ranking."""
     support_ids, support_probs = _build_sparse_target_support(
         next_token_logits=next_token_logits,
         sampling_info=sampling_info,
@@ -729,17 +743,34 @@ def sample_uno_tree_target_tokens(
         forward_width=verify_width,
         max_top_k=max_top_k,
     )
-    return _sample_from_support(support_ids, support_probs)
+    tokens = _sample_from_support(support_ids, support_probs)
+    if root_noise is not None:
+        root_ids = support_ids[:, 0].to(torch.int64)
+        scores = torch.log(support_probs[:, 0].float()) + root_noise.gather(1, root_ids)
+        pick = torch.argmax(scores, dim=-1, keepdim=True)
+        tokens[:, 0] = root_ids.gather(1, pick)[:, 0].to(tokens.dtype)
+    return tokens
 
 
 def pack_uno_tree_result(
     *,
-    clean_root_tokens: torch.Tensor,
+    clean_root_tokens: torch.Tensor | None,
     eagle_predict: torch.Tensor,
     eagle_accept_lens: torch.Tensor,
     draft_width: int,
+    batch_size: int | None = None,
 ) -> UnoTreeSamplingResult:
-    """Convert an internal EAGLE tree result into UNO's public row."""
+    """Convert an internal EAGLE tree result into UNO's public row.
+
+    ``clean_root_tokens`` is None for seed-root trees: the EAGLE path already
+    starts after the seed, so it is the whole row (up to F accepted + bonus)."""
+    if clean_root_tokens is None:
+        verify_width = eagle_predict.numel() // batch_size
+        predict_rows = eagle_predict.reshape(batch_size, verify_width)
+        output_ids = predict_rows.new_zeros((batch_size, draft_width + 1), dtype=torch.int64)
+        width = min(draft_width + 1, verify_width)
+        output_ids[:, :width].copy_(predict_rows[:, :width].to(dtype=output_ids.dtype))
+        return UnoTreeSamplingResult(output_ids=output_ids, accept_lens=eagle_accept_lens)
     clean_root_tokens = clean_root_tokens.reshape(-1).to(dtype=torch.int64)
     batch_size = clean_root_tokens.numel()
     verify_width = eagle_predict.numel() // batch_size

@@ -9,7 +9,11 @@ import torch
 from sglang.kernels.ops.mamba.causal_conv1d_linear_verify import causal_conv1d_linear_verify
 from sglang.srt.lora.backend.uno_fused_lora import UnoFusedLoRA
 from sglang.srt.speculative.uno_draft_quant import UnoMarlinDraftWeight
-from sglang.srt.speculative.uno_utils import sample_uno_candidates
+from sglang.srt.speculative.uno_rectifier import UnoRectifier
+from sglang.srt.speculative.uno_utils import (
+    _build_sparse_target_support,
+    sample_uno_candidates,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -109,6 +113,41 @@ class TestUnoDraftQuant(CustomTestCase):
         probs0, probs1 = d0.probs.reshape(batch, width - 1, vocab), d1.probs.reshape(batch, width, vocab)
         torch.testing.assert_close(probs1[:, 1:], probs0, rtol=0, atol=0)
         torch.testing.assert_close(probs1[:, 0], torch.softmax(logits[:, 0].float(), -1), rtol=1e-5, atol=1e-6)
+
+
+    def test_clean_row_joins_the_rectified_sparse_distribution(self):
+        # top-k 20 takes the sparse path: the clean support (num_candidates + tie pad) is wider
+        # than the rectifier lattice, so the drafts are padded with q = 0 columns.
+        batch, width, vocab, num_candidates = 3, 6, 512, 32
+        gen = torch.Generator(device=_DEVICE).manual_seed(0)
+        w1, w2 = (torch.randn(vocab, 16, generator=gen, device=_DEVICE) * 0.3 for _ in range(2))
+        rectifier = UnoRectifier(markov_w1=w1, markov_w2=w2, num_candidates=num_candidates)
+        logits = torch.randn(batch, width, vocab, device=_DEVICE) * 3
+        info = SimpleNamespace(
+            temperatures=torch.ones(batch, 1, device=_DEVICE),
+            top_ks=torch.full((batch,), 20, dtype=torch.int32, device=_DEVICE),
+            top_ps=torch.full((batch,), 0.95, device=_DEVICE),
+            need_top_k_sampling=True, need_top_p_sampling=True, need_min_p_sampling=False,
+        )
+        cands, dist = sample_uno_candidates(draft_logits=logits, sampling_info=info, max_top_k=20,
+                                            rectifier=rectifier, include_clean=True)
+        self.assertEqual(tuple(cands.shape), (batch, width))
+        self.assertIsNotNone(dist.token_ids)
+        self.assertEqual(dist.token_ids.shape[:2], (batch, width))
+        dense = torch.zeros(batch, width, vocab, device=_DEVICE).scatter_add_(
+            2, dist.token_ids.long(), dist.probs.float())
+        torch.testing.assert_close(dense.sum(-1), torch.ones(batch, width, device=_DEVICE),
+                                   rtol=0, atol=1e-5)
+        self.assertTrue(bool((dense.gather(2, cands[:, :, None].long()) > 0).all()))
+        clean_ids, clean_probs = _build_sparse_target_support(
+            next_token_logits=logits[:, 0, :], sampling_info=info, batch_size=batch,
+            forward_width=1, max_top_k=num_candidates)
+        clean_dense = torch.zeros(batch, vocab, device=_DEVICE).scatter_add_(
+            1, clean_ids[:, 0].long(), clean_probs[:, 0].float())
+        torch.testing.assert_close(dense[:, 0], clean_dense, rtol=0, atol=0)
+        pad = dist.token_ids.shape[-1] - num_candidates
+        self.assertGreater(pad, 0)
+        self.assertTrue(bool((dist.probs[:, 1:, num_candidates:] == 0).all()))
 
 
 if __name__ == "__main__":

@@ -124,6 +124,7 @@ def _uno_tree_conv_kernel(
     parents,  # [B, NODE_STRIDE] int32 (IS_TREE)
     seed_x,  # [rows, dim] raw input of the seed token (SAVE_SEED / HAS_SEED)
     stride_seed,
+    seed_flag,  # [1] int32: the seed precedes the root (RUNTIME_SEED)
     dim,
     Q: tl.constexpr,
     NODE_STRIDE: tl.constexpr,
@@ -134,8 +135,11 @@ def _uno_tree_conv_kernel(
     IS_TREE: tl.constexpr,
     SAVE_SEED: tl.constexpr,
     HAS_SEED: tl.constexpr,
+    RUNTIME_SEED: tl.constexpr = False,
 ):
     row = tl.program_id(0).to(tl.int64)
+    if RUNTIME_SEED:
+        hs = tl.load(seed_flag) != 0
     seq = row // Q
     node = (row % Q).to(tl.int32)
     channels = tl.program_id(1) * BC + tl.arange(0, BC)
@@ -155,7 +159,10 @@ def _uno_tree_conv_kernel(
         from_x = cur >= 0
         safe = tl.maximum(cur, 0)
         missing = tl.maximum(-cur, 0)
-        if HAS_SEED:
+        if RUNTIME_SEED:
+            from_seed = hs & (cur == -1)
+            state_col = tl.where(hs, W - missing, W - 1 - missing)
+        elif HAS_SEED:
             from_seed = cur == -1
             state_col = W - missing
         else:
@@ -222,9 +229,12 @@ def uno_tree_conv(
     seed_x: Optional[torch.Tensor] = None,  # [rows, dim]
     save_seed: bool = False,
     has_seed: bool = False,
+    seed_flag: Optional[torch.Tensor] = None,  # [1] int32
 ) -> torch.Tensor:
     """``save_seed``: store row 0's input (the draft seed) into ``seed_x``;
-    ``has_seed``: the seed precedes the root (its state is not committed)."""
+    ``has_seed``: the seed precedes the root (its state is not committed).
+    ``seed_flag``: decide ``has_seed`` at run time from this device scalar
+    instead, so one CUDA graph serves both tree layouts."""
     tokens, dim = x.shape
     assert x.stride(1) == 1 and tokens % num_nodes == 0
     batch = tokens // num_nodes
@@ -244,6 +254,7 @@ def uno_tree_conv(
         parents if is_tree else cache_indices,
         seed_x if seed_x is not None else x,
         seed_x.stride(0) if seed_x is not None else 0,
+        seed_flag if seed_flag is not None else cache_indices,
         dim,
         Q=num_nodes,
         NODE_STRIDE=parents.stride(0) if is_tree else 0,
@@ -254,6 +265,7 @@ def uno_tree_conv(
         IS_TREE=is_tree,
         SAVE_SEED=save_seed,
         HAS_SEED=has_seed,
+        RUNTIME_SEED=seed_flag is not None,
         num_warps=4,
     )
     return out
@@ -271,10 +283,12 @@ def _uno_tree_gdn_verify_kernel(
     saved_k, saved_v, saved_g, saved_beta,  # [rows * NODE_STRIDE, ...]
     save_rows,  # [B]
     ancestors,  # [B, ANC_STRIDE] int8 ancestor matrix, row stride ANC_ROW (IS_TREE)
+    seed_flag,  # [1] int32: fold the saved seed in (RUNTIME_SEED)
     scale,
     SAVE_OFFSET: tl.constexpr,
     SEED_NODE: tl.constexpr,
     HAS_SEED: tl.constexpr,
+    RUNTIME_SEED: tl.constexpr,
     Q: tl.constexpr,
     QP: tl.constexpr,
     NODE_STRIDE: tl.constexpr,
@@ -342,9 +356,15 @@ def _uno_tree_gdn_verify_kernel(
     k_sq = tl.zeros([QP], dtype=tl.float32)
     q_sq = tl.zeros([QP], dtype=tl.float32)
     store_k = (i_v == 0) & (i_hv % (HV // H) == 0) & (save_row >= 0)
-    if HAS_SEED:
+    if HAS_SEED or RUNTIME_SEED:
         # The seed token sits between the committed state S0 and the root:
-        # S1 = e^{g_s} S0 + k_s u_s^T, folded in below.
+        # S1 = e^{g_s} S0 + k_s u_s^T, folded in below.  With RUNTIME_SEED the
+        # seed loads are masked by the device flag; masked off they read zeros,
+        # so the fold is the identity (decay 1, u_s 0).
+        if RUNTIME_SEED:
+            hs = tl.load(seed_flag) != 0
+        else:
+            hs = save_row >= -1  # always true, as a runtime scalar mask
         seed_row = save_row * NODE_STRIDE + SEED_NODE
         kks = tl.zeros([QP], dtype=tl.float32)
         qks = tl.zeros([QP], dtype=tl.float32)
@@ -369,8 +389,9 @@ def _uno_tree_gdn_verify_kernel(
                      mask=(slot >= 0) & (o_v[None, :] < V), other=0.0).to(tl.float32)
         ks += tl.dot(b_k, h0, input_precision=PRECISION)
         qs += tl.dot(b_q, h0, input_precision=PRECISION)
-        if HAS_SEED:
-            k_s = tl.load(saved_k + seed_row * (H * K) + i_h * K + o_k).to(tl.float32)
+        if HAS_SEED or RUNTIME_SEED:
+            k_s = tl.load(saved_k + seed_row * (H * K) + i_h * K + o_k,
+                          mask=(o_k < K) & hs, other=0.0).to(tl.float32)
             ss_sq += tl.sum(k_s * k_s)
             kks += tl.sum(b_k * k_s[None, :], axis=1)
             qks += tl.sum(b_q * k_s[None, :], axis=1)
@@ -381,11 +402,12 @@ def _uno_tree_gdn_verify_kernel(
     qk = qk * r_q[:, None] * r_k[None, :]
     ks = ks * r_k[:, None]
     qs = qs * r_q[:, None]
-    if HAS_SEED:
+    if HAS_SEED or RUNTIME_SEED:
         r_s = 1.0 / tl.sqrt(ss_sq + 1e-6)
-        g_s = tl.load(saved_g + seed_row * HV + i_hv)
-        beta_s = tl.load(saved_beta + seed_row * HV + i_hv)
-        v_s = tl.load(saved_v + seed_row * (HV * V) + i_hv * V + o_v).to(tl.float32)
+        g_s = tl.load(saved_g + seed_row * HV + i_hv, mask=hs, other=0.0)
+        beta_s = tl.load(saved_beta + seed_row * HV + i_hv, mask=hs, other=0.0)
+        v_s = tl.load(saved_v + seed_row * (HV * V) + i_hv * V + o_v,
+                      mask=(o_v < V) & hs, other=0.0).to(tl.float32)
         decay_s = tl.exp(g_s)
         u_s = beta_s * (v_s - decay_s * kss * r_s)
         ks = decay_s * ks + (kks * r_k * r_s)[:, None] * u_s[None, :]
@@ -445,8 +467,11 @@ def uno_tree_gdn_verify(
     precision: str = "tf32",
     save_offset: int = 0,
     seed_node: Optional[int] = None,
+    seed_flag: Optional[torch.Tensor] = None,  # [1] int32; needs seed_node
 ) -> torch.Tensor:
-    """``max_depth`` bounds the deepest node (root = 0); defaults to Q - 1."""
+    """``max_depth`` bounds the deepest node (root = 0); defaults to Q - 1.
+    ``seed_flag``: fold the saved seed (``seed_node``) only when this device
+    scalar is nonzero, so one CUDA graph serves both tree layouts."""
     tokens = q.shape[0]
     batch = tokens // num_nodes
     num_v_heads = state.shape[1]
@@ -475,10 +500,12 @@ def uno_tree_gdn_verify(
         saved_k, saved_v, saved_g, saved_beta,
         save_rows,
         ancestors if is_tree else cache_indices,
+        seed_flag if seed_flag is not None else cache_indices,
         scale,
         SAVE_OFFSET=save_offset,
         SEED_NODE=seed_node if seed_node is not None else 0,
-        HAS_SEED=seed_node is not None,
+        HAS_SEED=seed_node is not None and seed_flag is None,
+        RUNTIME_SEED=seed_flag is not None,
         Q=num_nodes,
         QP=qp,
         NODE_STRIDE=node_stride,

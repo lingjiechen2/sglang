@@ -94,10 +94,14 @@ def _verify_replayssm_launch(spec_info, batch_size: int, head_k_dim: int) -> dic
 
     if spec_info.spec_input_type not in (SpecInputType.UNO_DRAFT, SpecInputType.UNO_VERIFY):
         return {}
+    # More than 16 window tokens (e.g. the 17-row seed-in-verify pass of a 16-token
+    # block) run 32-row tiles, where four K chunks are fastest: 17 tokens, b1
+    # 44.8 -> 33.6 us, b4 85.0 -> 53.4 us per layer (16 tokens: 13.6 / 19.9 us).
+    wide = head_k_dim > 32 and int(getattr(spec_info, "draft_token_num", 0) or 0) > 16
     if batch_size < 4:
-        return {"block_v": 64, "num_warps": 4, "nk": 1}
+        return {"block_v": 64, "num_warps": 4, "nk": 4 if wide else 1}
     if batch_size < 8:
-        return {"block_v": 64, "num_warps": 2, "nk": 2}
+        return {"block_v": 64, "num_warps": 2, "nk": 4 if wide else 2}
     # tl.dot needs K chunks of at least 16 (K is padded to a power of two).
     nk = 4 if head_k_dim > 32 else 2
     return {"block_v": 128, "num_warps": 2, "nk": nk}
