@@ -1411,6 +1411,13 @@ class XllmMoVAAttention(_XllmMoVAAttentionBase):
             scaling_factor=self.router_scaling_factor,
             renormalize=self.renormalize,
         )
+        if getattr(self.uno_value_lora, "fused", False):
+            # UNO draft forward with the value fast path: the LoRA delta goes inside the routed projection.
+            values = self.uno_value_lora.project(
+                hidden_states, routing_weights, selected_values, self.v_experts.weight
+            )
+            if values is not None:
+                return values
         values = self.v_experts(hidden_states, routing_weights, selected_values)
         if self.uno_value_lora is not None:  # set only by --uno-mova-lora
             values = self.uno_value_lora(

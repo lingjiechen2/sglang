@@ -262,14 +262,16 @@ class _RowHook:
         return (out, *rest)
 
 
-FAST_PARTS = ("row", "gateup", "down")
+FAST_PARTS = ("row", "gateup", "down", "value")
 
 
 def fast_parts() -> set:
     """``SGLANG_UNO_MOVA_LORA_FAST``: which draft-row LoRA paths use the fast kernels (default: none).
 
     ``1``/``all`` = every path, or a comma list of ``row`` (dense / shared-expert forward hooks), ``gateup`` (routed
-    experts, before the activation) and ``down`` (routed experts, after the down GEMM)."""
+    experts, before the activation), ``down`` (routed experts, after the down GEMM) and ``value`` (MoVA value experts:
+    the LoRA delta is added inside the routed value projection, before its SiLU, instead of recomputing every value
+    expert densely for the draft rows)."""
     value = os.environ.get("SGLANG_UNO_MOVA_LORA_FAST", "").strip().lower()
     if value in ("", "0", "false", "off"):
         return set()
@@ -373,6 +375,60 @@ class UnoMovaExpertLoRAFast(UnoMovaExpertLoRA):
         down[:, 0, :].add_(delta.to(down.dtype))
 
 
+class UnoMovaValueLoRAFast(UnoMovaValueLoRA):
+    """``value`` fast path of :class:`UnoMovaValueLoRA` (same math).
+
+    The base routed value projection runs once over all rows with the LoRA delta added to every selected expert's
+    pre-SiLU projection; the delta is one packed LoRA over all rows with the seed rows exactly zero. No dense
+    projection through every value expert, no row gathers or scatters. :meth:`project` returns None outside a UNO draft
+    forward and for dtypes the fused kernel does not cover (the caller then runs the base path and :meth:`__call__`)."""
+
+    fused = True
+
+    def __init__(self, a, b, scaling, lora_backend):
+        super().__init__(a, b, scaling, lora_backend)
+        self.packed = _PackedLoRA([(a, b)], scaling)
+
+    def _delta(self, hidden_states, route):
+        return self.packed.delta(hidden_states, route)
+
+    def project(self, hidden_states, routing_weights, selected_experts, expert_weights):
+        if not hidden_states.is_cuda or hidden_states.dtype not in (torch.float16, torch.bfloat16):
+            return None
+        route = _draft_route(self.lora_backend, hidden_states.shape[0])
+        if route is None:
+            return None
+        from sglang.srt.layers.mova import routed_linear_with_delta
+
+        delta = self._delta(hidden_states, route)
+        return routed_linear_with_delta(hidden_states, expert_weights, routing_weights, selected_experts, delta)
+
+
+class UnoMovaPerExpertValueLoRAFast(UnoMovaPerExpertValueLoRA):
+    """``value`` fast path of :class:`UnoMovaPerExpertValueLoRA`: only the selected experts' adapters run (grouped GEMMs
+    over the ``tokens * top_k`` slots), and their deltas are added inside the routed value projection before the SiLU."""
+
+    fused = True
+
+    def __init__(self, a, b, scaling, lora_backend):
+        super().__init__(a, b, scaling, lora_backend)
+        self.a, self.b = a.contiguous(), b.contiguous()
+
+    def project(self, hidden_states, routing_weights, selected_experts, expert_weights):
+        if not hidden_states.is_cuda or hidden_states.dtype not in (torch.float16, torch.bfloat16):
+            return None
+        route = _draft_route(self.lora_backend, hidden_states.shape[0])
+        if route is None:
+            return None
+        from sglang.srt.layers.mova import routed_linear_with_delta
+
+        tokens, topk = selected_experts.shape
+        x = hidden_states.repeat_interleave(topk, dim=0)  # slot (row, k) = row * topk + k
+        delta = (expert_lora(x, selected_experts.reshape(-1), self.a, self.b) * self.scaling).view(tokens, topk, -1)
+        delta.view(route.batch_size, route.forward_width, topk, -1)[:, 0].zero_()  # seed rows: exactly the base path
+        return routed_linear_with_delta(hidden_states, expert_weights, routing_weights, selected_experts, delta)
+
+
 class _FastRowHook:
     """Fast :class:`_RowHook` for parts that cover the whole output (no all-reduce): one packed LoRA over all rows,
     seed rows exactly zero, added to the layer output in place (no clone, gather or scatter)."""
@@ -472,7 +528,8 @@ def attach_uno_mova_lora(manager: LoRAManager, model: torch.nn.Module, lora_path
                 raise ValueError(
                     f"Layer {layer} {name}: {a.shape[0]} per-expert adapters for {module.v_experts.weight.shape[0]} value experts."
                 )
-            module.uno_value_lora = UnoMovaPerExpertValueLoRA(a, b, scaling, backend)
+            cls = UnoMovaPerExpertValueLoRAFast if "value" in fast_parts() else UnoMovaPerExpertValueLoRA
+            module.uno_value_lora = cls(a, b, scaling, backend)
             attached += 1
             continue
         if name in _EXPERTS and a.ndim == 3:
@@ -491,7 +548,8 @@ def attach_uno_mova_lora(manager: LoRAManager, model: torch.nn.Module, lora_path
             module = decoder.self_attn
             if module.v_experts.output_size_per_partition != module.v_experts.output_size:
                 raise ValueError("--uno-mova-lora supports TP=1 only.")
-            module.uno_value_lora = UnoMovaValueLoRA(a, b, scaling, backend)
+            cls = UnoMovaValueLoRAFast if "value" in fast_parts() else UnoMovaValueLoRA
+            module.uno_value_lora = cls(a, b, scaling, backend)
         elif name in _EXPERTS:
             moe = layers[layer].mlp.experts
             proj = name.rpartition(".")[2]
