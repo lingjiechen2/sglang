@@ -220,6 +220,35 @@ def _routed_linear_cuda_chunk(
     return (projected * routing_weights.to(projected).unsqueeze(-1)).sum(dim=1)
 
 
+def _fake_mova_routed_linear_delta_cuda(
+    hidden_states: torch.Tensor,
+    expert_weights: torch.Tensor,
+    routing_weights: torch.Tensor,
+    selected_experts: torch.Tensor,
+    delta: torch.Tensor,
+) -> torch.Tensor:
+    return hidden_states.new_empty((hidden_states.shape[0], expert_weights.shape[1]))
+
+
+@register_custom_op(
+    op_name="mova_routed_linear_delta_cuda",
+    fake_impl=_fake_mova_routed_linear_delta_cuda,
+)
+def _routed_linear_delta_cuda_chunk(
+    hidden_states: torch.Tensor,
+    expert_weights: torch.Tensor,
+    routing_weights: torch.Tensor,
+    selected_experts: torch.Tensor,
+    delta: torch.Tensor,
+) -> torch.Tensor:
+    projected = _routed_projection_cuda(
+        hidden_states, expert_weights, routing_weights, selected_experts
+    )
+    # delta: [tokens, width] (shared by every selected expert) or [tokens, top_k, width] (per selected expert)
+    projected = F.silu(projected + (delta[:, None, :] if delta.dim() == 2 else delta))
+    return (projected * routing_weights.to(projected).unsqueeze(-1)).sum(dim=1)
+
+
 def _routed_linear_fp32(
     hidden_states: torch.Tensor,
     expert_weights: torch.Tensor,
@@ -358,3 +387,36 @@ class RoutedValueExperts(nn.Module):
             selected_experts,
         )
 
+
+def routed_linear_with_delta(
+    hidden_states: torch.Tensor,
+    expert_weights: torch.Tensor,
+    routing_weights: torch.Tensor,
+    selected_experts: torch.Tensor,
+    delta: torch.Tensor,
+) -> torch.Tensor:
+    """:func:`routed_linear` with ``delta`` added to the selected experts' projections before the SiLU.
+
+    ``delta`` is ``[tokens, width]`` (added to every selected expert of the token) or ``[tokens, top_k, width]``.
+    CUDA fp16/bf16 only (the fused first GEMM); used by UNO's draft-row value LoRA."""
+
+    if not hidden_states.is_cuda or hidden_states.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("routed_linear_with_delta supports CUDA fp16 and bf16 only")
+    if not hidden_states.is_contiguous() or not expert_weights.is_contiguous():
+        raise ValueError("Fused MoVA inputs and expert weights must be contiguous")
+    if hidden_states.shape[0] == 0:
+        return hidden_states.new_empty((0, expert_weights.shape[1]))
+    delta = delta.to(hidden_states.dtype)
+    outputs = []
+    for begin in range(0, hidden_states.shape[0], _ROUTED_LINEAR_CHUNK_SIZE):
+        end = min(begin + _ROUTED_LINEAR_CHUNK_SIZE, hidden_states.shape[0])
+        outputs.append(
+            _routed_linear_delta_cuda_chunk(
+                hidden_states[begin:end],
+                expert_weights,
+                routing_weights[begin:end],
+                selected_experts[begin:end],
+                delta[begin:end],
+            )
+        )
+    return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
