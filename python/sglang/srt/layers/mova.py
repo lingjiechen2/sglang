@@ -134,16 +134,13 @@ def _fake_mova_routed_linear_cuda(
     return hidden_states.new_empty((hidden_states.shape[0], expert_weights.shape[1]))
 
 
-@register_custom_op(
-    op_name="mova_routed_linear_cuda",
-    fake_impl=_fake_mova_routed_linear_cuda,
-)
-def _routed_linear_cuda_chunk(
+def _routed_projection_cuda(
     hidden_states: torch.Tensor,
     expert_weights: torch.Tensor,
     routing_weights: torch.Tensor,
     selected_experts: torch.Tensor,
 ) -> torch.Tensor:
+    """Pre-SiLU projections of every selected value expert, ``[tokens, top_k, width]`` (fused-MoE first GEMM)."""
     # Keep these imports local: CPU model inspection and mapping tests should
     # not initialize Triton or require the CUDA extension.
     import triton.language as tl
@@ -202,7 +199,24 @@ def _routed_linear_cuda_chunk(
         per_channel_quant=False,
         filter_expert=False,
     )
-    projected = F.silu(projected.view(num_tokens, top_k, output_size))
+    return projected.view(num_tokens, top_k, output_size)
+
+
+@register_custom_op(
+    op_name="mova_routed_linear_cuda",
+    fake_impl=_fake_mova_routed_linear_cuda,
+)
+def _routed_linear_cuda_chunk(
+    hidden_states: torch.Tensor,
+    expert_weights: torch.Tensor,
+    routing_weights: torch.Tensor,
+    selected_experts: torch.Tensor,
+) -> torch.Tensor:
+    projected = F.silu(
+        _routed_projection_cuda(
+            hidden_states, expert_weights, routing_weights, selected_experts
+        )
+    )
     return (projected * routing_weights.to(projected).unsqueeze(-1)).sum(dim=1)
 
 
@@ -343,3 +357,4 @@ class RoutedValueExperts(nn.Module):
             routing_weights,
             selected_experts,
         )
+
