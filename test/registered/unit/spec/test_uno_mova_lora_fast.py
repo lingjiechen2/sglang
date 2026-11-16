@@ -15,6 +15,10 @@ from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.speculative.uno_mova_lora import (
     UnoMovaExpertLoRA,
     UnoMovaExpertLoRAFast,
+    UnoMovaPerExpertValueLoRA,
+    UnoMovaPerExpertValueLoRAFast,
+    UnoMovaValueLoRA,
+    UnoMovaValueLoRAFast,
     _FastRowHook,
     _row_parts_cover_output,
     _RowHook,
@@ -32,8 +36,8 @@ def _backend(route):
 
 class TestFastParts(CustomTestCase):
     def test_parse(self):
-        for value, parts in (("", set()), ("0", set()), ("1", {"row", "gateup", "down"}), ("all", {"row", "gateup", "down"}),
-                             ("row,down", {"row", "down"})):
+        for value, parts in (("", set()), ("0", set()), ("1", {"row", "gateup", "down", "value"}), ("all", {"row", "gateup", "down", "value"}),
+                             ("row,down", {"row", "down"}), ("value", {"value"})):
             with mock.patch.dict(os.environ, {"SGLANG_UNO_MOVA_LORA_FAST": value}):
                 self.assertEqual(fast_parts(), parts)
         with mock.patch.dict(os.environ, {"SGLANG_UNO_MOVA_LORA_FAST": "row,bogus"}):
@@ -147,6 +151,65 @@ class TestFastExpertLoRA(CustomTestCase):
 
     def test_base_forward_returns_no_hooks(self):
         self.assertIsNone(UnoMovaExpertLoRAFast(self.parts, SCALE, _backend(None), {"gateup", "down"})(self.x))
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+class TestFastValueLoRA(CustomTestCase):
+    """``value``: the delta inside the routed projection matches the dense all-experts-then-gather path."""
+
+    NV, KV, WIDTH = 16, 4, 128
+
+    def setUp(self):
+        g = torch.Generator(device="cuda").manual_seed(2)
+        dev, bf = "cuda", torch.bfloat16
+        self.route = SimpleNamespace(batch_size=3, forward_width=4, total_rows=12)
+        self.m = 12
+        self.x = torch.randn(self.m, HIDDEN, device=dev, generator=g).to(bf)
+        self.w = (torch.randn(self.NV, self.WIDTH, HIDDEN, device=dev, generator=g) / HIDDEN**0.5).to(bf)
+        logits = torch.randn(self.m, self.NV, device=dev, generator=g)
+        top = logits.sigmoid().topk(self.KV, -1)
+        self.ids = top.indices.to(torch.int32)
+        self.rw = (top.values / top.values.sum(-1, keepdim=True)).to(bf)
+        self.a = (torch.randn(RANK, HIDDEN, device=dev, generator=g) / HIDDEN**0.5).to(bf)
+        self.b = (torch.randn(self.WIDTH, RANK, device=dev, generator=g) / RANK**0.5 / SCALE).to(bf)
+        self.pa = (torch.randn(self.NV, RANK, HIDDEN, device=dev, generator=g) / HIDDEN**0.5).to(bf)
+        self.pb = (torch.randn(self.NV, self.WIDTH, RANK, device=dev, generator=g) / RANK**0.5 / SCALE).to(bf)
+
+    def _plain(self):
+        from sglang.srt.layers.mova import routed_linear
+
+        return routed_linear(self.x, self.w, self.rw, self.ids)
+
+    def _check(self, slow, fast):
+        with get_context().override_server_args():
+            plain = self._plain()
+            base = slow(self.x, self.rw, self.ids, self.w, plain).float()
+            out = fast.project(self.x, self.rw, self.ids, self.w)
+        self.assertIsNotNone(out)
+        out = out.float()
+        effect = (base - plain.float()).norm(dim=-1)
+        diff = (out - base).norm(dim=-1)
+        drafts = [r for r in range(self.m) if r % 4 != 0]
+        self.assertGreater(effect[drafts].min().item(), 0)
+        self.assertLess((diff[drafts] / effect[drafts]).max().item(), 2e-2)
+        seeds = [r for r in range(self.m) if r % 4 == 0]
+        self.assertTrue(torch.equal(out[seeds], plain.float()[seeds]))
+
+    def test_shared(self):
+        for scale in (SCALE, 3.0):
+            with self.subTest(scale=scale):
+                self._check(UnoMovaValueLoRA(self.a, self.b, scale, _backend(self.route)),
+                            UnoMovaValueLoRAFast(self.a, self.b, scale, _backend(self.route)))
+
+    def test_per_expert(self):
+        self._check(UnoMovaPerExpertValueLoRA(self.pa, self.pb, SCALE, _backend(self.route)),
+                    UnoMovaPerExpertValueLoRAFast(self.pa, self.pb, SCALE, _backend(self.route)))
+
+    def test_base_forward_and_fp32_fall_back(self):
+        fast = UnoMovaValueLoRAFast(self.a, self.b, SCALE, _backend(None))
+        self.assertIsNone(fast.project(self.x, self.rw, self.ids, self.w))
+        fast = UnoMovaValueLoRAFast(self.a.float(), self.b.float(), SCALE, _backend(self.route))
+        self.assertIsNone(fast.project(self.x.float(), self.rw.float(), self.ids, self.w.float()))
 
 
 if __name__ == "__main__":
