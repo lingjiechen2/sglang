@@ -55,15 +55,19 @@ _DEFAULT_MAX_ROWS = {"int4": 64, "fp8": 48}
 _INT4_KERNEL_CHOICES = ("fit", "marlin", "humming", "auto")
 _HUMMING_MIN_ROWS = int(os.environ.get("UNO_DRAFT_HUMMING_MIN_ROWS", "32"))
 _RESOLVED_INT4_KERNEL: str | None = None
+_WARNED_UNSIZED = False
 
 
 def _int4_kernel_setting() -> str:
     """The requested setting: UNO_DRAFT_INT4_KERNEL, else --uno-draft-int4-kernel."""
     setting = os.environ.get("UNO_DRAFT_INT4_KERNEL")
     if setting is None:
-        from sglang.srt.runtime_context import get_spec
+        try:
+            from sglang.srt.runtime_context import get_spec
 
-        setting = getattr(get_spec(), "uno_draft_int4_kernel", "fit")
+            setting = getattr(get_spec(), "uno_draft_int4_kernel", "fit")
+        except Exception:  # no runtime context (unit tests, tooling): take the default
+            setting = "fit"
     if setting not in _INT4_KERNEL_CHOICES:
         raise ValueError(
             f"UNO_DRAFT_INT4_KERNEL must be one of {_INT4_KERNEL_CHOICES}, got {setting!r}"
@@ -75,13 +79,16 @@ def peak_draft_rows() -> int | None:
     """Largest draft row count this server can issue, or None when it cannot be read.
 
     Reads already-parsed server args, so it does not depend on init order. Returns None
-    when max_running_requests is unset (the scheduler then sizes it from free memory and
-    the peak is effectively unbounded).
+    both when max_running_requests is unset (the scheduler then sizes it from free memory
+    and the peak is effectively unbounded) and when the args cannot be read at all.
     """
-    from sglang.srt.runtime_context import get_schedule, get_spec
+    try:
+        from sglang.srt.runtime_context import get_schedule, get_spec
 
-    concurrency = getattr(get_schedule(), "max_running_requests", None)
-    width = getattr(get_spec(), "speculative_num_draft_tokens", None)
+        concurrency = getattr(get_schedule(), "max_running_requests", None)
+        width = getattr(get_spec(), "speculative_num_draft_tokens", None)
+    except Exception:
+        return None
     if not concurrency or not width:
         return None
     return int(concurrency) * int(width)
@@ -97,17 +104,56 @@ def int4_kernel() -> str:
         _RESOLVED_INT4_KERNEL = setting
         return _RESOLVED_INT4_KERNEL
     rows = peak_draft_rows()
-    # Unbounded concurrency: the server can go wide, so take the kernel that wins there.
-    resolved = "humming" if rows is None or rows >= _HUMMING_MIN_ROWS else "marlin"
+    if rows is None:
+        # Either max_running_requests is unset -- the server can then go as wide as memory
+        # allows, so take the kernel that wins there -- or the args are not readable yet.
+        # The second case must NOT be cached: caching it would pin a server that only ever
+        # drafts 8 rows to Humming for its whole life and quietly lose ~18% on every draft
+        # GEMM. Warn once (this runs per folded weight) and resolve again on the next call.
+        global _WARNED_UNSIZED
+        if not _WARNED_UNSIZED:
+            _WARNED_UNSIZED = True
+            logger.warning(
+                "UNO draft INT4 kernel: cannot size the draft from max_running_requests; "
+                "using humming for now. Pass --uno-draft-int4-kernel to pin the choice."
+            )
+        return "humming"
+    resolved = "humming" if rows >= _HUMMING_MIN_ROWS else "marlin"
     _RESOLVED_INT4_KERNEL = resolved
     logger.info(
-        "UNO draft INT4 kernel: %s (peak draft rows %s, crossover %d); "
+        "UNO draft INT4 kernel: %s (peak draft rows %d, crossover %d); "
         "pass --uno-draft-int4-kernel to choose explicitly.",
         resolved,
-        rows if rows is not None else "unbounded (max_running_requests unset)",
+        rows,
         _HUMMING_MIN_ROWS,
     )
     return resolved
+
+
+# Env switches removed with the features they drove. They are rejected rather than ignored:
+# a stale script that still passes one would otherwise start cleanly and quietly produce
+# numbers for a different configuration than the caller believes they asked for.
+_REMOVED_ENV = {
+    "UNO_DRAFT_INT4_ACT": "W4A8 draft activations were removed on 2026-11-18; the INT4 "
+    "draft GEMMs are weight-only (W4A16). It cut one forward's draft GEMMs from 7.49 to "
+    "6.52 ms at 64 rows but cost ~1.8-2% acceptance length, and nothing shipped with it on.",
+    "UNO_DRAFT_HUMMING_PDL": "the Humming PDL patch was removed on 2026-11-18. Its +1.2% "
+    "at c=8 was a single seed, smaller than the baseline's own 4-seed spread, and it "
+    "rewrote the installed humming package at runtime.",
+    "UNO_DRAFT_INT4_GROUP": "the INT4 scale group is fixed at 128 since 2026-11-18. "
+    "Per-channel scales only ever won on the removed W4A8 path.",
+}
+
+
+def _reject_removed_env() -> None:
+    for name, why in _REMOVED_ENV.items():
+        if os.environ.get(name) not in (None, ""):
+            raise ValueError(f"{name} is no longer supported: {why} Unset it.")
+
+
+_reject_removed_env()
+
+
 # The Humming draft GEMMs are weight-only: INT4 weights, bf16 activations (W4A16). A W4A8
 # variant (UNO_DRAFT_INT4_ACT=int8, per-row int8 activations on the int8 wgmma path) was
 # measured and dropped on 2026-11-18: it cut one forward's draft GEMMs from 7.49 to 6.52 ms
