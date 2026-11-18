@@ -1625,6 +1625,18 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`none`, `bf16`, `fp8`, `int4`</td>
     </tr>
         <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--uno-draft-quant-skipped`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With `--uno-draft-weight-quant` fp8/int4: fold the decoder layers the draft adapter carries no weights for with rank 0, so their draft GEMMs read the quantized copy too. Verify forwards stay bf16, so committed tokens are unchanged; only the acceptance length can move. 'auto' applies it when the adapter skips layers and is a no-op otherwise. Default 'off' keeps the plain base path.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`off`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`auto`, `on`, `off`</td>
+    </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--uno-draft-int4-kernel`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>INT4 draft GEMM kernel with `--uno-draft-weight-quant int4`. Marlin wins below ~32 draft rows, Humming above; the bf16 fallback row limit follows the kernel (64 Marlin, 256 Humming). 'fit' picks one at startup from max running requests x draft width, 'auto' builds both and dispatches per CUDA graph. Default 'marlin' is the pre-Humming behaviour.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`marlin`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`marlin`, `fit`, `humming`, `auto`</td>
+    </tr>
+        <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--speculative-accept-threshold-single`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Accept a draft token if its probability in the target model is greater than this threshold.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`1.0`</td>
