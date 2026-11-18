@@ -30,6 +30,17 @@ _EXPAND_TUNED = os.environ.get("UNO_LORA_EXPAND_TUNED", "0") == "1"
 # multiple of 256) returns the row-strided view to callers that accept one (the GDN in_proj split)
 # instead of copying it to a contiguous tensor. Default off.
 _RANK0_VIEW = os.environ.get("UNO_RANK0_VIEW", "0") == "1"
+_SILU_AND_MUL = None
+
+
+def _silu_and_mul():
+    """The shared SiluAndMul module for rank-0 folds (built once, not per call)."""
+    global _SILU_AND_MUL
+    if _SILU_AND_MUL is None:
+        from sglang.srt.layers.activation import SiluAndMul
+
+        _SILU_AND_MUL = SiluAndMul()
+    return _SILU_AND_MUL
 
 
 @triton.jit
@@ -190,13 +201,11 @@ class UnoFusedLoRA(msgspec.Struct, frozen=True):
     def forward_silu_mul(self, x: torch.Tensor, *, forward_width: int) -> torch.Tensor:
         """silu(gate) * up of a folded two-slice gate_up layer, in one pass."""
         full = self._draft_gemm(x)
+        if self.rank == 0:
+            # Base-only fold of a layer the adapter skips (--uno-draft-quant-skipped): no LoRA.
+            return _silu_and_mul()(full[:, : self.out_features].contiguous())
         rows = full.shape[0]
         inter = self.out_features // 2
-        if self.rank == 0:
-            # Base-only fold of a layer the adapter skips (UNO_DRAFT_QUANT_SKIPPED): no LoRA.
-            from sglang.srt.layers.activation import SiluAndMul
-
-            return SiluAndMul()(full[:, : self.out_features].contiguous())
         out = torch.empty((rows, inter), dtype=full.dtype, device=full.device)
         block_m, block_n = (16, 32) if rows <= 16 else (64, 64)
         # Measured on H200 (inter 17408, rank 128): two stages up to 64 rows.
@@ -230,7 +239,7 @@ class UnoFusedLoRA(msgspec.Struct, frozen=True):
     def forward(self, x: torch.Tensor, *, forward_width: int, strided_ok: bool = False) -> torch.Tensor:
         full = self._draft_gemm(x)
         if self.rank == 0:
-            # Base-only fold of a layer the adapter skips (UNO_DRAFT_QUANT_SKIPPED): no LoRA.
+            # Base-only fold of a layer the adapter skips (--uno-draft-quant-skipped): no LoRA.
             out = full[:, : self.out_features]
             if out.is_contiguous() or (strided_ok and _RANK0_VIEW and out.stride(1) == 1):
                 return out
