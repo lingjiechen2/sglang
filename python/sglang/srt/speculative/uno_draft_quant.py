@@ -29,13 +29,18 @@ _DEFAULT_MAX_ROWS = {"int4": 64, "fp8": 48}
 
 # INT4 draft GEMM kernel, from --uno-draft-int4-kernel (UNO_DRAFT_INT4_KERNEL overrides):
 #
-#   "fit" (default) Pick ONE kernel at startup from this server's peak draft row count,
-#                   max_running_requests * speculative_num_draft_tokens: Marlin below
-#                   UNO_DRAFT_HUMMING_MIN_ROWS rows, Humming from there on. Only the chosen
-#                   kernel's packing is built, so the server holds one INT4 copy. A server
-#                   launched at concurrency 1 with B8 drafts 8 rows and gets Marlin; at
-#                   concurrency 8 it drafts 64 rows and gets Humming.
-#   "marlin"        Always Marlin.
+#   "marlin"        (default) Always Marlin -- the behaviour before Humming existed, so the
+#                   default leaves an existing INT4 draft bit for bit as it was. Note the
+#                   row limit travels with the kernel: Marlin keeps the quantized draft to
+#                   64 rows and falls back to the bf16 GEMM above it, Humming to 256, so
+#                   switching kernels DOES change the draft (and the acceptance length)
+#                   above 64 rows even though the two kernels agree bit for bit below it.
+#   "fit"           Pick ONE kernel at startup from an upper bound on this server's draft
+#                   row count, max_running_requests * speculative_num_draft_tokens: Marlin
+#                   below UNO_DRAFT_HUMMING_MIN_ROWS rows, Humming from there on. Only the
+#                   chosen kernel's packing is built, so the server holds one INT4 copy. A
+#                   server launched at concurrency 1 with B8 drafts 8 rows and gets Marlin;
+#                   at concurrency 8 it drafts 64 rows and gets Humming.
 #   "humming"       Always Humming (Marlin's packing is dropped after it is built).
 #   "auto"          Build BOTH packings and dispatch per CUDA graph on the actual row count.
 #                   Optimal at every row count one server sees -- an in-flight count that
@@ -65,9 +70,9 @@ def _int4_kernel_setting() -> str:
         try:
             from sglang.srt.runtime_context import get_spec
 
-            setting = getattr(get_spec(), "uno_draft_int4_kernel", "fit")
+            setting = getattr(get_spec(), "uno_draft_int4_kernel", "marlin")
         except Exception:  # no runtime context (unit tests, tooling): take the default
-            setting = "fit"
+            setting = "marlin"
     if setting not in _INT4_KERNEL_CHOICES:
         raise ValueError(
             f"UNO_DRAFT_INT4_KERNEL must be one of {_INT4_KERNEL_CHOICES}, got {setting!r}"
@@ -76,7 +81,16 @@ def _int4_kernel_setting() -> str:
 
 
 def peak_draft_rows() -> int | None:
-    """Largest draft row count this server can issue, or None when it cannot be read.
+    """Upper bound on the draft row count this server can issue, or None if unreadable.
+
+    This is an UPPER BOUND, not the exact peak: seed-in-verify drafts
+    speculative_num_draft_tokens - 1 rows per request, so the real peak is one row per
+    in-flight request lower (concurrency 1 with B8 reports 9 and drafts 8; concurrency 8
+    reports 72 and drafts 64). Deriving the exact width would mean re-deriving
+    seed_in_verify and tree mode here; the bound only ever errs toward Humming, and since
+    it is compared against an aggregate crossover (UNO_DRAFT_HUMMING_MIN_ROWS, measured
+    over all the draft GEMMs at once) that slack is within the threshold's own precision.
+    Pass --uno-draft-int4-kernel explicitly when the choice has to be exact.
 
     Reads already-parsed server args, so it does not depend on init order. Returns None
     both when max_running_requests is unset (the scheduler then sizes it from free memory
