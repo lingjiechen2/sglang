@@ -115,7 +115,11 @@ def int4_kernel() -> str:
         return _RESOLVED_INT4_KERNEL
     setting = _int4_kernel_setting()
     if setting != "fit":
+        # Log the resolved kernel however it was chosen, not just under "fit": a server whose
+        # flag never took effect looks exactly like one whose flag did, and this line is the
+        # only way to tell them apart from the outside.
         _RESOLVED_INT4_KERNEL = setting
+        logger.info("UNO draft INT4 kernel: %s (explicitly requested).", setting)
         return _RESOLVED_INT4_KERNEL
     rows = peak_draft_rows()
     if rows is None:
@@ -128,14 +132,15 @@ def int4_kernel() -> str:
         if not _WARNED_UNSIZED:
             _WARNED_UNSIZED = True
             logger.warning(
-                "UNO draft INT4 kernel: cannot size the draft from max_running_requests; "
-                "using humming for now. Pass --uno-draft-int4-kernel to pin the choice."
+                "UNO draft INT4 kernel: humming (cannot size the draft from "
+                "max_running_requests, so assuming it can go wide). Pass "
+                "--uno-draft-int4-kernel to pin the choice."
             )
         return "humming"
     resolved = "humming" if rows >= _HUMMING_MIN_ROWS else "marlin"
     _RESOLVED_INT4_KERNEL = resolved
     logger.info(
-        "UNO draft INT4 kernel: %s (peak draft rows %d, crossover %d); "
+        "UNO draft INT4 kernel: %s (fit: draft rows at most %d, crossover %d); "
         "pass --uno-draft-int4-kernel to choose explicitly.",
         resolved,
         rows,
