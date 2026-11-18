@@ -63,13 +63,37 @@ def init_uno_lora_manager(
     #   uno_ref.lora_id  -> base model + UNO draft LoRA
     manager.fetch_new_loras({None, uno_ref.lora_id})
     # MoVA routed/value LoRA attaches its own per-layer tensors; leave that path exactly as before.
-    skipped_layers = (
-        frozenset()
-        if get_spec().uno_mova_lora
-        else _bypass_uno_lora_skipped_layers(manager, uno_ref.lora_id)
+    # --uno-draft-quant-skipped {auto,on,off} (with --uno-fused-lora and a quantized draft):
+    # layers the adapter skips get a base-only (rank 0) fold instead of the plain base path, so
+    # their draft GEMMs read the quantized copy too; verify forwards still run the bf16 base GEMMs.
+    # 'auto' and 'on' behave the same -- an adapter that skips no layers leaves rank0_layers empty
+    # either way -- and are kept distinct so the default can move to 'auto' without reading as
+    # "force". UNO_DRAFT_QUANT_SKIPPED=1 still forces it on, for the pre-flag eval scripts.
+    skipped_mode = get_spec().uno_draft_quant_skipped
+    if os.environ.get("UNO_DRAFT_QUANT_SKIPPED", "0") == "1":
+        skipped_mode = "on"
+    quant_skipped = (
+        skipped_mode in ("auto", "on")
+        and get_spec().uno_fused_lora
+        and get_spec().uno_draft_weight_quant in ("fp8", "int4")
+        and not get_spec().uno_mova_lora
     )
+    rank0_layers = frozenset()
+    if quant_skipped:
+        skipped_layers = frozenset()
+        rank0_layers = _uno_lora_skipped_layers(manager, uno_ref.lora_id)
+        logger.info(
+            "UNO LoRA layer skip: %d/%d layers fold base-only for the quantized draft %s.",
+            len(rank0_layers), len(manager.lora_modules), sorted(rank0_layers),
+        )
+    else:
+        skipped_layers = (
+            frozenset()
+            if get_spec().uno_mova_lora
+            else _bypass_uno_lora_skipped_layers(manager, uno_ref.lora_id)
+        )
     if get_spec().uno_fused_lora:
-        _fold_uno_lora(manager, uno_ref.lora_id, skipped_layers)
+        _fold_uno_lora(manager, uno_ref.lora_id, skipped_layers, rank0_layers)
         if get_spec().uno_draft_weight_quant in ("fp8", "int4"):
             _quantize_uno_fused(manager, get_spec().uno_draft_weight_quant)
         elif os.environ.get("UNO_DRAFT_HESSIAN_OUT"):
@@ -118,11 +142,15 @@ def _bypass_uno_lora_skipped_layers(manager: LoRAManager, lora_id: str) -> froze
 
 
 def _fold_uno_lora(
-    manager: LoRAManager, lora_id: str, skipped_layers: frozenset[int] = frozenset()
+    manager: LoRAManager,
+    lora_id: str,
+    skipped_layers: frozenset[int] = frozenset(),
+    rank0_layers: frozenset[int] = frozenset(),
 ) -> None:
     """Fold the resident UNO adapter's LoRA-A rows into each base GEMM.
 
     Layers in ``skipped_layers`` (no adapter weights) are not folded and keep the base GEMM.
+    Layers in ``rank0_layers`` are folded with rank 0: the base weight only, no LoRA expand.
     """
     from sglang.srt.lora.backend.uno_fused_lora import (
         fold_uno_lora_group,
@@ -138,6 +166,11 @@ def _fold_uno_lora(
         rank=adapter.config.r,
         scaling=adapter.scaling,
     )
+    rank0_kwargs = dict(fold_kwargs, rank=0)
+
+    def kwargs_for(layer_id):
+        return rank0_kwargs if layer_id in rank0_layers else fold_kwargs
+
     grouped: set[int] = set()
     num_groups = 0
     # GDN input projections share one input; fold qkvz|ba like the base fused GEMM.
@@ -147,7 +180,7 @@ def _fold_uno_lora(
         if getattr(module, "layer_id", None) in skipped_layers:
             continue
         members = [module.in_proj_qkvz, module.in_proj_ba]
-        fused = fold_uno_lora_group(members, **fold_kwargs)
+        fused = fold_uno_lora_group(members, **kwargs_for(getattr(module, "layer_id", None)))
         if fused is None:
             continue
         module.uno_fused_in_proj = fused
@@ -161,7 +194,7 @@ def _fold_uno_lora(
         for module in layer_modules.values():
             if id(module) in grouped:
                 continue
-            fused = fold_uno_lora_layer(module, **fold_kwargs)
+            fused = fold_uno_lora_layer(module, **kwargs_for(layer_id))
             if fused is None:
                 num_kept += 1
                 continue

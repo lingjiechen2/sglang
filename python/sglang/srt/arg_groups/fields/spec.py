@@ -65,6 +65,22 @@ class Spec(msgspec.Struct):
         "'bf16' runs that verify layout with unquantized drafts. Default 'none' "
         "keeps the regular UNO layout.",
     ] = "none"
+    uno_draft_quant_skipped: A[
+        Literal["auto", "on", "off"],
+        "With --uno-fused-lora and --uno-draft-weight-quant fp8/int4: fold the "
+        "decoder layers the draft adapter carries no weights for (LoRA layer skip, "
+        "e.g. the skip75 adapter leaves 48 of 64 layers without LoRA) with rank 0 "
+        "instead of sending them down the plain base path, so their draft GEMMs "
+        "read the quantized copy too. Verify forwards still run the bf16 base "
+        "GEMMs, so committed tokens are unchanged; only the draft proposals, hence "
+        "the acceptance length, can move. Measured on skip75 B8 int4 (H200, 5 datasets, "
+        "geomean): +10.6% throughput at c=8 for -1.2 to -2.0% acceptance, and +21.2% at "
+        "c=1 with no consistent acceptance change -- the gain is larger the more "
+        "bandwidth-bound the regime, since this only removes weight bytes. 'auto' "
+        "(default) applies it whenever the adapter actually skips layers and the draft is "
+        "quantized, and is a no-op for an adapter that covers every layer; 'off' keeps the "
+        "plain base path. Ignored with --uno-mova-lora.",
+    ] = "auto"
     uno_draft_int4_kernel: A[
         Literal["fit", "marlin", "humming", "auto"],
         "Which INT4 GEMM the draft forwards use with --uno-draft-weight-quant int4. Marlin "
