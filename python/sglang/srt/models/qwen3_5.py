@@ -921,8 +921,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         fused GEMM; draft rows add the LoRA-B expand."""
         fused = self.uno_fused_in_proj
         if self.in_proj_qkvz.lora_active:
+            # The output is split into qkvz / ba views below, so a row-strided result is fine.
             out = self.in_proj_qkvz.lora_backend.run_uno_fused_lora(
-                fused, hidden_states
+                fused, hidden_states, strided_ok=True
             )
         elif os.environ.get("UNO_FUSED_BASE_CONCAT") == "1":
             out = fused.base_forward(hidden_states)
