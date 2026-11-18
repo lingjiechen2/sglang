@@ -144,25 +144,42 @@ def int4_kernel() -> str:
     return resolved
 
 
-# Env switches removed with the features they drove. They are rejected rather than ignored:
-# a stale script that still passes one would otherwise start cleanly and quietly produce
-# numbers for a different configuration than the caller believes they asked for.
+# Env switches removed with the features they drove, as name -> (why, values that asked for
+# what this code still does). A value that asked for something else is rejected rather than
+# ignored: a stale script that still passes one would otherwise start cleanly and quietly
+# produce numbers for a different configuration than the caller believes they asked for. A
+# value that happens to name the surviving behaviour only gets a warning -- sbatch inherits
+# the submitting shell, so a leftover export must not be able to fail an unrelated job.
 _REMOVED_ENV = {
-    "UNO_DRAFT_INT4_ACT": "W4A8 draft activations were removed on 2026-11-18; the INT4 "
-    "draft GEMMs are weight-only (W4A16). It cut one forward's draft GEMMs from 7.49 to "
-    "6.52 ms at 64 rows but cost ~1.8-2% acceptance length, and nothing shipped with it on.",
-    "UNO_DRAFT_HUMMING_PDL": "the Humming PDL patch was removed on 2026-11-18. Its +1.2% "
-    "at c=8 was a single seed, smaller than the baseline's own 4-seed spread, and it "
-    "rewrote the installed humming package at runtime.",
-    "UNO_DRAFT_INT4_GROUP": "the INT4 scale group is fixed at 128 since 2026-11-18. "
-    "Per-channel scales only ever won on the removed W4A8 path.",
+    "UNO_DRAFT_INT4_ACT": (
+        "W4A8 draft activations were removed on 2026-11-18; the INT4 draft GEMMs are "
+        "weight-only (W4A16). It cut one forward's draft GEMMs from 7.49 to 6.52 ms at 64 "
+        "rows but cost ~1.8-2% acceptance length, and nothing shipped with it on.",
+        ("bf16",),
+    ),
+    "UNO_DRAFT_HUMMING_PDL": (
+        "the Humming PDL patch was removed on 2026-11-18. Its +1.2% at c=8 was a single "
+        "seed, smaller than the baseline's own 4-seed spread, and it rewrote the installed "
+        "humming package at runtime.",
+        ("0",),
+    ),
+    "UNO_DRAFT_INT4_GROUP": (
+        "the INT4 scale group is fixed at 128 since 2026-11-18. Per-channel scales only "
+        "ever won on the removed W4A8 path.",
+        ("128",),
+    ),
 }
 
 
 def _reject_removed_env() -> None:
-    for name, why in _REMOVED_ENV.items():
-        if os.environ.get(name) not in (None, ""):
-            raise ValueError(f"{name} is no longer supported: {why} Unset it.")
+    for name, (why, kept) in _REMOVED_ENV.items():
+        value = os.environ.get(name)
+        if value in (None, ""):
+            continue
+        if value in kept:
+            logger.warning("%s is no longer read: %s Unset it.", name, why)
+            continue
+        raise ValueError(f"{name}={value!r} is no longer supported: {why} Unset it.")
 
 
 _reject_removed_env()
