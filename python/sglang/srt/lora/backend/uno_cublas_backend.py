@@ -446,10 +446,9 @@ class UnoCublasLoRABackend(TritonLoRABackend):
             producer_stream=stream,
         )
 
-    def run_uno_fused_lora(self, fused, x: torch.Tensor, strided_ok: bool = False) -> torch.Tensor:
-        """One folded base+LoRA-A GEMM and the LoRA-B expand (``--uno-fused-lora``).
-        ``strided_ok``: the caller accepts a row-strided (column-padded) output."""
-        return fused.forward(x, forward_width=self._route().forward_width, strided_ok=strided_ok)
+    def run_uno_fused_lora(self, fused, x: torch.Tensor) -> torch.Tensor:
+        """One folded base+LoRA-A GEMM and the LoRA-B expand (``--uno-fused-lora``)."""
+        return fused.forward(x, forward_width=self._route().forward_width)
 
     def run_uno_fused_lora_silu_mul(self, fused, x: torch.Tensor) -> torch.Tensor:
         """Folded gate_up GEMM plus LoRA-B expand fused with SiLU*mul."""

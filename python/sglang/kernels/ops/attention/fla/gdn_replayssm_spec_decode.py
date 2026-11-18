@@ -53,10 +53,6 @@ _IS_GFX95 = is_gfx95_supported()
 # row), form D_spec = R T^T and D_spec F with fp32 (ieee) tl.dot instead of BS rank-1 updates.
 # Same math, different fp32 summation order. Default off.
 _OUTER_DOT = os.environ.get("UNO_RSSM_OUTER_DOT", "0") == "1"
-# UNO_RSSM_TRUNC_INV=1: run the serial (I + A)^{-1} row loop only up to the real window length
-# instead of the padded BS (9 rows -> 7 steps instead of 14). Rows past the window are all-zero
-# in A, so the skipped steps only rewrote zero rows: same values. Default off.
-_TRUNC_INV = os.environ.get("UNO_RSSM_TRUNC_INV", "0") == "1"
 
 
 @triton.jit
@@ -120,7 +116,6 @@ def gdn_replayssm_spec_circular_kernel(
     NULL_BLOCK_ID: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
     OUTER_DOT: tl.constexpr = False,
-    TRUNC_INV: tl.constexpr = False,
 ):
     i_v = tl.program_id(0)
     i_n = tl.program_id(1)
@@ -406,19 +401,11 @@ def gdn_replayssm_spec_circular_kernel(
     A_mat = tl.where(lower, beta_s[:, None] * tl.exp(diff_ij) * kk_mat, 0.0)
 
     b_Ai = -A_mat
-    if TRUNC_INV:
-        n_inv = tl.minimum(spec_len, BS).to(tl.int32)
-        for ii in range(2, n_inv):
-            row = tl.sum(tl.where((o_s == ii)[:, None], -A_mat, 0.0), axis=0)
-            row = tl.where(o_s < ii, row, 0.0)
-            row = row + tl.sum(row[:, None] * b_Ai, axis=0)
-            b_Ai = tl.where((o_s == ii)[:, None], row, b_Ai)
-    else:
-        for ii in range(2, BS):
-            row = tl.sum(tl.where((o_s == ii)[:, None], -A_mat, 0.0), axis=0)
-            row = tl.where(o_s < ii, row, 0.0)
-            row = row + tl.sum(row[:, None] * b_Ai, axis=0)
-            b_Ai = tl.where((o_s == ii)[:, None], row, b_Ai)
+    for ii in range(2, BS):
+        row = tl.sum(tl.where((o_s == ii)[:, None], -A_mat, 0.0), axis=0)
+        row = tl.where(o_s < ii, row, 0.0)
+        row = row + tl.sum(row[:, None] * b_Ai, axis=0)
+        b_Ai = tl.where((o_s == ii)[:, None], row, b_Ai)
     T_mat = b_Ai + (o_s[:, None] == o_s[None, :]).to(tl.float32)
 
     # ------------------------------------------------------------------
@@ -1198,7 +1185,6 @@ def _launch_gdn_spec(
         NULL_BLOCK_ID=null_block_id,
         DOT_PRECISION=dot_precision,
         OUTER_DOT=_OUTER_DOT and BS >= 16 and BV >= 16,
-        TRUNC_INV=_TRUNC_INV,
         num_warps=num_warps,
         num_stages=num_stages,
     )
