@@ -283,7 +283,19 @@ def _quantize_uno_fused(manager: LoRAManager, kind: str) -> None:
         if gptq_dir:
             # Marlin-ready GPTQ results are cached next to the Hessians; a cached
             # weight needs no Hessian (and no GPTQ pass) on later starts.
-            cache = os.path.join(gptq_dir, "marlin_cache", f"{key}.int4g{UnoMarlinDraftWeight.group}.pt")
+            # The file name carries the folded shape: the same module key maps to
+            # different [N, K] under different folds (rank-128 vs the rank-0 fold of
+            # UNO_DRAFT_QUANT_SKIPPED), and the cached qweight/scales are shape-specific.
+            # Without N in the name those configs collided on one file and the reader
+            # crashed in gptq_codes() ("shape '[-1, 16512]' is invalid for input of size
+            # 665600", a file written when that weight was N=16640). The Hessian below is
+            # a [K, K] input covariance, so it is N-independent and stays keyed on `key`.
+            n_cat, k_cat = fused.weight_cat.shape
+            cache = os.path.join(
+                gptq_dir,
+                "marlin_cache",
+                f"{key}.n{n_cat}k{k_cat}.int4g{UnoMarlinDraftWeight.group}.pt",
+            )
             path = os.path.join(gptq_dir, f"{key}.pt")
             if os.path.exists(cache):
                 num_gptq += 1
