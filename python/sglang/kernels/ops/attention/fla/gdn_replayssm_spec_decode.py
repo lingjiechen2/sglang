@@ -39,6 +39,8 @@ mask, so this kernel is valid only for linear draft chains
 
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -47,6 +49,14 @@ from sglang.kernels.ops.attention.fla.utils import is_tf32_supported
 from sglang.srt.utils import is_gfx95_supported
 
 _IS_GFX95 = is_gfx95_supported()
+# UNO_RSSM_OUTER_DOT=1: for windows padded to BS >= 16 (e.g. the 9-row UNO verify with the seed
+# row), form D_spec = R T^T and D_spec F with fp32 (ieee) tl.dot instead of BS rank-1 updates.
+# Same math, different fp32 summation order. Default off.
+_OUTER_DOT = os.environ.get("UNO_RSSM_OUTER_DOT", "0") == "1"
+# UNO_RSSM_TRUNC_INV=1: run the serial (I + A)^{-1} row loop only up to the real window length
+# instead of the padded BS (9 rows -> 7 steps instead of 14). Rows past the window are all-zero
+# in A, so the skipped steps only rewrote zero rows: same values. Default off.
+_TRUNC_INV = os.environ.get("UNO_RSSM_TRUNC_INV", "0") == "1"
 
 
 @triton.jit
@@ -109,6 +119,8 @@ def gdn_replayssm_spec_circular_kernel(
     IS_FLUSH: tl.constexpr,
     NULL_BLOCK_ID: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
+    OUTER_DOT: tl.constexpr = False,
+    TRUNC_INV: tl.constexpr = False,
 ):
     i_v = tl.program_id(0)
     i_n = tl.program_id(1)
@@ -394,11 +406,19 @@ def gdn_replayssm_spec_circular_kernel(
     A_mat = tl.where(lower, beta_s[:, None] * tl.exp(diff_ij) * kk_mat, 0.0)
 
     b_Ai = -A_mat
-    for ii in range(2, BS):
-        row = tl.sum(tl.where((o_s == ii)[:, None], -A_mat, 0.0), axis=0)
-        row = tl.where(o_s < ii, row, 0.0)
-        row = row + tl.sum(row[:, None] * b_Ai, axis=0)
-        b_Ai = tl.where((o_s == ii)[:, None], row, b_Ai)
+    if TRUNC_INV:
+        n_inv = tl.minimum(spec_len, BS).to(tl.int32)
+        for ii in range(2, n_inv):
+            row = tl.sum(tl.where((o_s == ii)[:, None], -A_mat, 0.0), axis=0)
+            row = tl.where(o_s < ii, row, 0.0)
+            row = row + tl.sum(row[:, None] * b_Ai, axis=0)
+            b_Ai = tl.where((o_s == ii)[:, None], row, b_Ai)
+    else:
+        for ii in range(2, BS):
+            row = tl.sum(tl.where((o_s == ii)[:, None], -A_mat, 0.0), axis=0)
+            row = tl.where(o_s < ii, row, 0.0)
+            row = row + tl.sum(row[:, None] * b_Ai, axis=0)
+            b_Ai = tl.where((o_s == ii)[:, None], row, b_Ai)
     T_mat = b_Ai + (o_s[:, None] == o_s[None, :]).to(tl.float32)
 
     # ------------------------------------------------------------------
@@ -409,11 +429,14 @@ def gdn_replayssm_spec_circular_kernel(
         tl.float32
     )
     R_mat = beta_s[None, :] * (v_tile - expG_s[None, :] * hw_k)
-    D_spec = tl.zeros([BV, BS], dtype=tl.float32)
-    for j in tl.static_range(BS):
-        Rj = tl.sum(tl.where((o_s == j)[None, :], R_mat, 0.0), axis=1)
-        Tj = tl.sum(tl.where((o_s == j)[None, :], T_mat, 0.0), axis=1)
-        D_spec += Rj[:, None] * Tj[None, :]
+    if OUTER_DOT:
+        D_spec = tl.dot(R_mat, tl.trans(T_mat), input_precision="ieee")
+    else:
+        D_spec = tl.zeros([BV, BS], dtype=tl.float32)
+        for j in tl.static_range(BS):
+            Rj = tl.sum(tl.where((o_s == j)[None, :], R_mat, 0.0), axis=1)
+            Tj = tl.sum(tl.where((o_s == j)[None, :], T_mat, 0.0), axis=1)
+            D_spec += Rj[:, None] * Tj[None, :]
 
     # ------------------------------------------------------------------
     # outputs.
@@ -421,11 +444,14 @@ def gdn_replayssm_spec_circular_kernel(
     causalF = (o_s[:, None] <= o_s[None, :]) & mask_s[:, None] & mask_s[None, :]
     diff_ji = G_s[None, :] - G_s[:, None]
     F_mat = tl.where(causalF, tl.exp(diff_ji) * kq_mat, 0.0)
-    DF = tl.zeros([BV, BS], dtype=tl.float32)
-    for j in tl.static_range(BS):
-        Dj = tl.sum(tl.where((o_s == j)[None, :], D_spec, 0.0), axis=1)
-        Fj = tl.sum(tl.where((o_s == j)[:, None], F_mat, 0.0), axis=0)
-        DF += Dj[:, None] * Fj[None, :]
+    if OUTER_DOT:
+        DF = tl.dot(D_spec, F_mat, input_precision="ieee")
+    else:
+        DF = tl.zeros([BV, BS], dtype=tl.float32)
+        for j in tl.static_range(BS):
+            Dj = tl.sum(tl.where((o_s == j)[None, :], D_spec, 0.0), axis=1)
+            Fj = tl.sum(tl.where((o_s == j)[:, None], F_mat, 0.0), axis=0)
+            DF += Dj[:, None] * Fj[None, :]
     O_tile = expG_s[None, :] * hw_q + DF
 
     tl.store(p_o, tl.trans(O_tile).to(p_o.dtype.element_ty), mask=out_mask)
@@ -1171,6 +1197,8 @@ def _launch_gdn_spec(
         IS_FLUSH=is_flush_kernel,
         NULL_BLOCK_ID=null_block_id,
         DOT_PRECISION=dot_precision,
+        OUTER_DOT=_OUTER_DOT and BS >= 16 and BV >= 16,
+        TRUNC_INV=_TRUNC_INV,
         num_warps=num_warps,
         num_stages=num_stages,
     )

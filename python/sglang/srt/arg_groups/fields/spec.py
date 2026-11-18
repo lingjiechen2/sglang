@@ -55,6 +55,53 @@ class Spec(msgspec.Struct):
         "fused kernel per layer, instead of separate LoRA GEMMs. Changes only "
         "how draft forwards execute; base-only forwards are unchanged.",
     ] = False
+    uno_draft_weight_quant: A[
+        Literal["none", "bf16", "fp8", "int4"],
+        "Linear UNO with --uno-fused-lora: draft forwards read a weight-only "
+        "Marlin copy (fp8 per-channel or int4 group-128) of each folded [W; A] "
+        "weight. The seed row and the clean token then move into the bf16 verify "
+        "(both passes run --speculative-num-draft-tokens + 1 rows; the last draft "
+        "row is unused), so committed tokens still follow the target model. "
+        "'bf16' runs that verify layout with unquantized drafts. Default 'none' "
+        "keeps the regular UNO layout.",
+    ] = "none"
+    uno_draft_quant_skipped: A[
+        Literal["auto", "on", "off"],
+        "With --uno-fused-lora and --uno-draft-weight-quant fp8/int4: fold the "
+        "decoder layers the draft adapter carries no weights for (LoRA layer skip, "
+        "e.g. the skip75 adapter leaves 48 of 64 layers without LoRA) with rank 0 "
+        "instead of sending them down the plain base path, so their draft GEMMs "
+        "read the quantized copy too. Verify forwards still run the bf16 base "
+        "GEMMs, so committed tokens are unchanged; only the draft proposals, hence "
+        "the acceptance length, can move. Measured on skip75 B8 int4 (H200, 5 datasets, "
+        "geomean): +10.6% throughput at c=8 for -1.2 to -2.0% acceptance, and +21.2% at "
+        "c=1 with no consistent acceptance change -- the gain is larger the more "
+        "bandwidth-bound the regime, since this only removes weight bytes. 'auto' applies "
+        "it whenever the adapter actually skips layers and the draft is quantized, and is a "
+        "no-op for an adapter that covers every layer; 'on' is the same thing spelled as a "
+        "demand. Default 'off' keeps the plain base path, so the draft proposals -- and the "
+        "acceptance length -- stay exactly as they were before this flag existed. Ignored "
+        "with --uno-mova-lora.",
+    ] = "off"
+    uno_draft_int4_kernel: A[
+        Literal["fit", "marlin", "humming", "auto"],
+        "Which INT4 GEMM the draft forwards use with --uno-draft-weight-quant int4. Marlin "
+        "dequantizes in registers and wins at small row counts; Humming uses Hopper wgmma "
+        "and wins from ~32 rows on (H200, one forward's draft GEMMs: Marlin 4.69 / 7.06 / "
+        "11.26 ms vs Humming 5.54 / 6.54 / 8.33 ms at 8 / 32 / 64 rows). Both read the same "
+        "GPTQ codes and scales, so the choice never moves the acceptance length -- but the "
+        "row limit above which the draft falls back to the bf16 GEMM does follow the kernel "
+        "(64 for Marlin, 256 for Humming), and that limit does move it. Default 'marlin' is "
+        "therefore the pre-Humming behaviour, unchanged. 'fit' picks one at startup from an "
+        "upper bound on this server's draft row count (--max-running-requests x "
+        "--speculative-num-draft-tokens), building only that kernel's packing: concurrency 1 "
+        "with B8 drafts 8 rows and gets Marlin, concurrency 8 drafts 64 rows and gets "
+        "Humming. 'humming' forces Humming at every row count. 'auto' builds both and "
+        "dispatches per CUDA graph on the actual row count, which is optimal even for the "
+        "ramp-up and tail forwards but holds two INT4 copies (25.2 vs 12.6 GB of draft "
+        "weights on Qwen3.8-27B skip75); it is what the c=8 and c=1 measurements above were "
+        "taken in. UNO_DRAFT_INT4_KERNEL overrides this.",
+    ] = "marlin"
     uno_mova_lora: A[
         bool,
         "Apply the MoVA LoRA parts shipped next to the UNO LoRA "

@@ -1,3 +1,4 @@
+import os
 from typing import Optional, Tuple, Union
 
 import msgspec
@@ -72,6 +73,17 @@ def _uses_linear_verify_conv(spec_info, window, width: int, retrieve_next_token)
     )
 
 
+def _uno_draft_keeps_conv_state(spec_info) -> bool:
+    """True for UNO draft passes under --uno-draft-weight-quant (seed in verify)."""
+    from sglang.srt.runtime_context import get_spec
+    from sglang.srt.speculative.spec_info import SpecInputType
+
+    return (
+        getattr(spec_info, "spec_input_type", None) == SpecInputType.UNO_DRAFT
+        and get_spec().uno_draft_weight_quant != "none"
+    )
+
+
 def _verify_replayssm_launch(spec_info, batch_size: int, head_k_dim: int) -> dict:
     """UNO ReplaySSM verify launch config; others keep the kernel defaults.
 
@@ -83,12 +95,26 @@ def _verify_replayssm_launch(spec_info, batch_size: int, head_k_dim: int) -> dic
 
     if spec_info.spec_input_type not in (SpecInputType.UNO_DRAFT, SpecInputType.UNO_VERIFY):
         return {}
+    # More than 16 window tokens (e.g. the 17-row seed-in-verify pass of a 16-token
+    # block) run 32-row tiles, where four K chunks are fastest: 17 tokens, b1
+    # 44.8 -> 33.6 us, b4 85.0 -> 53.4 us per layer (16 tokens: 13.6 / 19.9 us).
+    wide = head_k_dim > 32 and int(getattr(spec_info, "draft_token_num", 0) or 0) > 16
     if batch_size < 4:
-        return {"block_v": 64, "num_warps": 4, "nk": 1}
+        return {"block_v": 64, "num_warps": 4, "nk": 4 if wide else 1}
     if batch_size < 8:
-        return {"block_v": 64, "num_warps": 2, "nk": 2}
+        return {"block_v": 64, "num_warps": 2, "nk": 4 if wide else 2}
     # tl.dot needs K chunks of at least 16 (K is padded to a power of two).
     nk = 4 if head_k_dim > 32 else 2
+    # UNO_RSSM_NK8=1 (default off): a 9..16-token verify window (seed-in-verify, e.g. linear B8's
+    # 9 rows) runs 16-row tiles, where eight K chunks are fastest at batch 8: 9 tokens
+    # 26.5 -> 23.3 us per layer (8 tokens in 8-row tiles stay at nk 4, 13.7 us).
+    if (
+        os.environ.get("UNO_RSSM_NK8", "0") == "1"
+        and spec_info.spec_input_type == SpecInputType.UNO_VERIFY
+        and head_k_dim >= 128
+        and 8 < int(getattr(spec_info, "draft_token_num", 0) or 0) <= 16  # window width
+    ):
+        nk = 8
     return {"block_v": 128, "num_warps": 2, "nk": nk}
 
 
@@ -1122,6 +1148,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
             mixed_qkv_reshaped = mixed_qkv.view(
                 batch_size, draft_token_num, -1
             ).transpose(1, 2)
+            # --uno-draft-weight-quant: no commit follows the draft pass (the
+            # verify re-runs the seed row), so the draft must leave conv_state
+            # as committed; only the window is written.
+            keep_conv_state = _uno_draft_keeps_conv_state(forward_batch.spec_info)
+            if keep_conv_state and not linear_verify_conv:
+                raise NotImplementedError(
+                    "--uno-draft-weight-quant needs the dedup linear-verify conv window."
+                )
             if linear_verify_conv:
                 mixed_qkv_processed = causal_conv1d_linear_verify(
                     mixed_qkv_reshaped,
@@ -1132,6 +1166,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     conv_state_indices=cache_indices[:batch_size],
                     intermediate_conv_window=intermediate_conv_window_cache,
                     intermediate_state_indices=intermediate_state_indices[:batch_size],
+                    update_conv_state=not keep_conv_state,
                 )
             else:
                 mixed_qkv_processed = causal_conv1d_update(

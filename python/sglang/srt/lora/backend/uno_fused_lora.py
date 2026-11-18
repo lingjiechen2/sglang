@@ -11,7 +11,8 @@ their inputs and results are unchanged.
 from __future__ import annotations
 
 import logging
-from typing import Optional
+import os
+from typing import Any, Optional
 
 import msgspec
 import torch
@@ -23,6 +24,23 @@ from sglang.kernels.jit.utils import is_arch_support_pdl
 logger = logging.getLogger(__name__)
 
 _PDL_KWARGS = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+# UNO_LORA_EXPAND_TUNED=1: re-tuned launch of the gate_up silu-mul expand for 17-64 draft rows.
+_EXPAND_TUNED = os.environ.get("UNO_LORA_EXPAND_TUNED", "0") == "1"
+# UNO_RANK0_VIEW=1: a rank-0 fold whose draft GEMM output is column-padded (Humming pads N to a
+# multiple of 256) returns the row-strided view to callers that accept one (the GDN in_proj split)
+# instead of copying it to a contiguous tensor. Default off.
+_RANK0_VIEW = os.environ.get("UNO_RANK0_VIEW", "0") == "1"
+_SILU_AND_MUL = None
+
+
+def _silu_and_mul():
+    """The shared SiluAndMul module for rank-0 folds (built once, not per call)."""
+    global _SILU_AND_MUL
+    if _SILU_AND_MUL is None:
+        from sglang.srt.layers.activation import SiluAndMul
+
+        _SILU_AND_MUL = SiluAndMul()
+    return _SILU_AND_MUL
 
 
 @triton.jit
@@ -166,6 +184,15 @@ class UnoFusedLoRA(msgspec.Struct, frozen=True):
     out_splits: tuple[int, ...] = ()
     # LoRA-A block of the gate and up slices, for a folded gate_up layer.
     gate_up_blocks: tuple[int, ...] = ()
+    # Optional quantized copy of weight_cat read by draft forwards only
+    # (--uno-draft-weight-quant; see speculative/uno_draft_quant.py).
+    draft_weight: Any = None
+
+    def _draft_gemm(self, x: torch.Tensor) -> torch.Tensor:
+        # Row count is fixed per captured graph, so this choice is static per graph.
+        if self.draft_weight is not None and x.shape[0] <= self.draft_weight.max_rows:
+            return self.draft_weight(x)
+        return torch.mm(x, self.weight_cat.t())
 
     def base_forward(self, x: torch.Tensor) -> torch.Tensor:
         """The folded layers' base outputs only (no LoRA), as one GEMM."""
@@ -173,13 +200,20 @@ class UnoFusedLoRA(msgspec.Struct, frozen=True):
 
     def forward_silu_mul(self, x: torch.Tensor, *, forward_width: int) -> torch.Tensor:
         """silu(gate) * up of a folded two-slice gate_up layer, in one pass."""
-        full = torch.mm(x, self.weight_cat.t())
+        full = self._draft_gemm(x)
+        if self.rank == 0:
+            # Base-only fold of a layer the adapter skips (--uno-draft-quant-skipped): no LoRA.
+            return _silu_and_mul()(full[:, : self.out_features].contiguous())
         rows = full.shape[0]
         inter = self.out_features // 2
         out = torch.empty((rows, inter), dtype=full.dtype, device=full.device)
         block_m, block_n = (16, 32) if rows <= 16 else (64, 64)
         # Measured on H200 (inter 17408, rank 128): two stages up to 64 rows.
         stages = {"num_stages": 2} if rows <= 64 else {}
+        num_warps = 4
+        if _EXPAND_TUNED and 16 < rows <= 64:
+            # 64 rows, 6 weight copies in one CUDA graph: 9.78 -> 7.93 us per call.
+            block_n, num_warps, stages = 32, 8, {"num_stages": 3}
         grid = (triton.cdiv(rows, block_m), triton.cdiv(inter, block_n))
         _uno_lora_expand_silu_mul_kernel[grid](
             full,
@@ -196,14 +230,20 @@ class UnoFusedLoRA(msgspec.Struct, frozen=True):
             R=self.rank,
             BLOCK_M=block_m,
             BLOCK_N=block_n,
-            num_warps=4,
+            num_warps=num_warps,
             **stages,
             **_PDL_KWARGS,
         )
         return out
 
-    def forward(self, x: torch.Tensor, *, forward_width: int) -> torch.Tensor:
-        full = torch.mm(x, self.weight_cat.t())
+    def forward(self, x: torch.Tensor, *, forward_width: int, strided_ok: bool = False) -> torch.Tensor:
+        full = self._draft_gemm(x)
+        if self.rank == 0:
+            # Base-only fold of a layer the adapter skips (--uno-draft-quant-skipped): no LoRA.
+            out = full[:, : self.out_features]
+            if out.is_contiguous() or (strided_ok and _RANK0_VIEW and out.stride(1) == 1):
+                return out
+            return out.contiguous()
         rows = full.shape[0]
         out = torch.empty((rows, self.out_features), dtype=full.dtype, device=full.device)
         # Measured on H200 with Qwen3.8-27B layer shapes (rank 128).

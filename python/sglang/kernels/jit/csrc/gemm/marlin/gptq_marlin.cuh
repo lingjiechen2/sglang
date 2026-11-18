@@ -25,6 +25,8 @@
 
 #include <sgl_kernel/scalar_type.hpp>
 
+#include <algorithm>
+
 #include "kernel.h"
 #include "marlin_template.h"
 
@@ -409,6 +411,15 @@ MarlinFuncPtr get_marlin_kernel(
   if (false) {
   }
 
+#ifdef SGL_MARLIN_SMALL_M_TILES
+  // Module for explicitly configured small-M launches (gptq_marlin_gemm_cfg):
+  // uint4b8 only, with extra thread tiles the default module does not build.
+  COMMON_GET_IF(host::kU4B8)
+  COMMON_GET_IF_M1(host::kU4B8, 8, 16, 256)
+  COMMON_GET_IF_M1(host::kU4B8, 4, 16, 128)
+  COMMON_GET_IF_M234(host::kU4B8, 4, 16, 128)
+  COMMON_GET_IF_M234(host::kU4B8, 8, 8, 256)
+#else
   COMMON_GET_IF(host::kU4)
   COMMON_GET_IF(host::kU4B8)
   COMMON_GET_IF(host::kU8B128)
@@ -425,6 +436,7 @@ MarlinFuncPtr get_marlin_kernel(
     }
     FZP_GET_IF(host::kU4)
   }
+#endif
 
   return kernel;
 }
@@ -541,7 +553,9 @@ void marlin_mm(
     int sms,
     bool use_atomic_add,
     bool use_fp32_reduce,
-    bool is_zp_float) {
+    bool is_zp_float,
+    int num_threads_init = -1,
+    int blocks_per_sm = 1) {
   if (has_zp) {
     host::RuntimeCheck(
         q_type == host::kU4 || q_type == host::kU8, "q_type must be u4 or u8 when has_zp = True. Got = ", q_type.str());
@@ -629,8 +643,8 @@ void marlin_mm(
     exec_config_t exec_cfg;
     thread_config_t thread_tfg;
     if (thread_k != -1 && thread_n != -1) {
-      thread_tfg = thread_config_t{thread_k, thread_n, default_threads};
-      exec_cfg = exec_config_t{1, thread_tfg};
+      thread_tfg = thread_config_t{thread_k, thread_n, num_threads_init > 0 ? num_threads_init : default_threads};
+      exec_cfg = exec_config_t{blocks_per_sm, thread_tfg};
       host::RuntimeCheck(prob_n % thread_n == 0, "prob_n = ", prob_n, " is not divisible by thread_n = ", thread_n);
       host::RuntimeCheck(prob_k % thread_k == 0, "prob_k = ", prob_k, " is not divisible by thread_k = ", thread_k);
     } else {
@@ -755,6 +769,15 @@ void marlin_mm(
     host::RuntimeDeviceCheck(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem_new));
 
+    if (exec_cfg.blocks_per_sm > 1) {
+      // Blocks of a slice wait on each other's locks: launch only as many per SM
+      // as can be resident at once.
+      int resident = 0;
+      host::RuntimeDeviceCheck(
+          cudaOccupancyMaxActiveBlocksPerMultiprocessor(&resident, kernel, num_threads, max_shared_mem_new));
+      blocks = sms * std::max(1, std::min(resident, exec_cfg.blocks_per_sm));
+    }
+
     bool part_use_atomic_add = use_atomic_add && div_ceil(prob_m_split, 64) * prob_n <= 2048;
 
     host::LaunchKernel(blocks, num_threads, stream, max_shared_mem_new)(
@@ -788,7 +811,7 @@ void marlin_mm(
 }  // namespace device::marlin
 
 template <typename scalar_t>
-void gptq_marlin_gemm(
+void gptq_marlin_gemm_impl(
     tvm::ffi::TensorView a,
     tvm::ffi::TensorView b_q_weight,
     tvm::ffi::TensorView b_scales,
@@ -804,7 +827,11 @@ void gptq_marlin_gemm(
     bool is_k_full,
     bool use_atomic_add,
     bool use_fp32_reduce,
-    bool is_zp_float) {
+    bool is_zp_float,
+    int thread_k_init,
+    int thread_n_init,
+    int num_threads_init,
+    int blocks_per_sm) {
   using namespace host;
 
   ScalarType const b_q_type = ScalarType::from_id(b_q_type_id);
@@ -960,12 +987,14 @@ void gptq_marlin_gemm(
   int sms = -1;
   RuntimeDeviceCheck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
 
+  // One lock per thread block.
+  RuntimeCheck(blocks_per_sm >= 1, "blocks_per_sm = ", blocks_per_sm, " must be >= 1");
   RuntimeCheck(
-      workspace.size(0) >= sms, "workspace.size(0) = ", workspace.size(0), " is below min_workspace_size = ", sms);
-
-  // Hardcoded defaults (auto config)
-  int thread_k_init = -1;
-  int thread_n_init = -1;
+      workspace.size(0) >= sms * blocks_per_sm,
+      "workspace.size(0) = ",
+      workspace.size(0),
+      " is below min_workspace_size = ",
+      sms * blocks_per_sm);
 
   // Compute c_tmp and a_tmp pointers
   // c_tmp and a_tmp are pre-allocated by caller
@@ -999,7 +1028,64 @@ void gptq_marlin_gemm(
       sms,
       use_atomic_add,
       use_fp32_reduce,
-      is_zp_float);
+      is_zp_float,
+      num_threads_init,
+      blocks_per_sm);
+}
+
+template <typename scalar_t>
+void gptq_marlin_gemm(
+    tvm::ffi::TensorView a,
+    tvm::ffi::TensorView b_q_weight,
+    tvm::ffi::TensorView b_scales,
+    tvm::ffi::TensorView global_scale,
+    tvm::ffi::TensorView b_zeros,
+    tvm::ffi::TensorView g_idx,
+    tvm::ffi::TensorView perm,
+    tvm::ffi::TensorView c,
+    tvm::ffi::TensorView c_tmp,
+    tvm::ffi::TensorView a_tmp,
+    tvm::ffi::TensorView workspace,
+    int64_t b_q_type_id,
+    bool is_k_full,
+    bool use_atomic_add,
+    bool use_fp32_reduce,
+    bool is_zp_float) {
+  // Auto config: heuristic thread tile, one block per SM.
+  gptq_marlin_gemm_impl<scalar_t>(
+      a, b_q_weight, b_scales, global_scale, b_zeros, g_idx, perm, c, c_tmp, a_tmp, workspace,
+      b_q_type_id, is_k_full, use_atomic_add, use_fp32_reduce, is_zp_float, -1, -1, -1, 1);
+}
+
+// Explicit launch config: thread tile (thread_k, thread_n, num_threads) and
+// thread blocks per SM. workspace needs one lock per block (SMs * blocks_per_sm).
+template <typename scalar_t>
+void gptq_marlin_gemm_cfg(
+    tvm::ffi::TensorView a,
+    tvm::ffi::TensorView b_q_weight,
+    tvm::ffi::TensorView b_scales,
+    tvm::ffi::TensorView global_scale,
+    tvm::ffi::TensorView b_zeros,
+    tvm::ffi::TensorView g_idx,
+    tvm::ffi::TensorView perm,
+    tvm::ffi::TensorView c,
+    tvm::ffi::TensorView c_tmp,
+    tvm::ffi::TensorView a_tmp,
+    tvm::ffi::TensorView workspace,
+    int64_t b_q_type_id,
+    bool is_k_full,
+    bool use_atomic_add,
+    bool use_fp32_reduce,
+    bool is_zp_float,
+    int64_t thread_k,
+    int64_t thread_n,
+    int64_t num_threads,
+    int64_t blocks_per_sm) {
+  gptq_marlin_gemm_impl<scalar_t>(
+      a, b_q_weight, b_scales, global_scale, b_zeros, g_idx, perm, c, c_tmp, a_tmp, workspace,
+      b_q_type_id, is_k_full, use_atomic_add, use_fp32_reduce, is_zp_float,
+      static_cast<int>(thread_k), static_cast<int>(thread_n), static_cast<int>(num_threads),
+      static_cast<int>(blocks_per_sm));
 }
 
 }  // namespace sglang

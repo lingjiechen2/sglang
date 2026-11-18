@@ -54,7 +54,7 @@ from sglang.srt.speculative.uno_draft_window import (
 from sglang.srt.speculative.uno_info import UnoDraftInput, UnoForwardInput
 from sglang.srt.speculative.uno_rectifier import UnoRectifier, load_uno_rectifier
 from sglang.srt.speculative.uno_tree import build_uno_tree_proposal
-from sglang.srt.speculative.uno_tree_gdn import enable_uno_tree_gdn
+from sglang.srt.speculative.uno_tree_gdn import enable_uno_tree_gdn, get_uno_tree_gdn
 from sglang.srt.speculative.uno_utils import (
     build_uno_draft_input,
     extract_uno_recycle_tail,
@@ -122,6 +122,43 @@ class UnoWorkerV2(BaseSpecWorker):
         self.tree_depth = int(get_spec().speculative_num_steps) if self.tree_mode else 1
         self.num_speculative_proposals = self.forward_width - 1
         self.tail_width = self.forward_width + 1
+        # --uno-draft-weight-quant: drafts may read quantized weights, so the seed
+        # row and the clean token are verified in bf16: the verify runs
+        # forward_width = F + 1 rows (resolved from the F-token block),
+        # [seed, clean, drafts], and the draft runs draft_width = F rows.
+        self.draft_weight_quant = get_spec().uno_draft_weight_quant
+        self.seed_in_verify = (not self.tree_mode) and self.draft_weight_quant != "none"
+        # Tree mode with a quantized draft cannot take the seed's KV, GDN inputs or
+        # the clean token from the draft: the seed becomes the verify tree's root
+        # and the clean row the first tree level (Q >= F + 1).
+        self.tree_seed_root = self.tree_mode and self.draft_weight_quant != "none"
+        # Above this many draft rows every draft GEMM and lm_head run in bf16, the
+        # draft is exact, and the cheaper clean-root tree applies again (chosen per
+        # batch; see UnoTreeGdnState.dynamic).
+        self._tree_seed_root_max_rows = 1 << 30
+        # Seed-root trees: couple the first level with the root's target sample
+        # through shared Gumbel noise (UNO_TREE_COUPLED_ROOT, default 2; 0 = off,
+        # 1 = couple only, 2 = also give the first noisy candidate the first
+        # level's mass when shaping the tree; see _forward_decode_tree).
+        self.tree_coupled_root = (
+            int(os.environ.get("UNO_TREE_COUPLED_ROOT", "2")) if self.tree_seed_root else 0
+        )
+        if self.tree_mode and self.draft_weight_quant in ("fp8", "int4"):
+            from sglang.srt.speculative.uno_draft_quant import default_max_rows
+
+            self._tree_seed_root_max_rows = int(
+                os.environ.get(
+                    "UNO_DRAFT_QUANT_MAX_ROWS", default_max_rows(self.draft_weight_quant)
+                )
+            )
+        self.block_width = (
+            self.forward_width - 1 if self.seed_in_verify else self.forward_width
+        )
+        # Seed-in-verify drafts are [seed, noise x (F - 1)]: F rows, one fewer than
+        # the verify, so they run on a private F-wide attention backend and CUDA
+        # graph (as tree drafts do). Otherwise drafts share the verify width.
+        self.draft_width = self.block_width if self.seed_in_verify else self.forward_width
+        self._private_draft = self.tree_mode or self.seed_in_verify
 
         # Compatibility fields read by speculative infrastructure.
         self.speculative_num_draft_tokens = self.verify_width
@@ -208,7 +245,7 @@ class UnoWorkerV2(BaseSpecWorker):
             with get_spec().override(
                 speculative_num_steps=1,
                 speculative_eagle_topk=1,
-                speculative_num_draft_tokens=self.forward_width,
+                speculative_num_draft_tokens=self.draft_width,
             ):
                 return model_runner._get_attention_backend(init_new_workspace=True)
         finally:
@@ -217,7 +254,7 @@ class UnoWorkerV2(BaseSpecWorker):
     def init_attention_backends(self):
         """Initialize only UNO's private backend after target pool allocation."""
 
-        if self.tree_mode:
+        if self._private_draft:
             self._uno_draft_attn_backend = self._build_uno_draft_attn_backend()
             if self._uno_draft_window > 0:
                 # The private tree-draft backend never runs the verify pass, so the window can stay on.
@@ -249,8 +286,20 @@ class UnoWorkerV2(BaseSpecWorker):
             enable_uno_tree_gdn(
                 self.model_runner.req_to_token_pool,
                 self.verify_width,
-                max_depth=self.forward_width - 1,
+                max_depth=self.forward_width if self.tree_seed_root else self.forward_width - 1,
             )
+            if self.tree_seed_root:
+                if get_exec().mamba.enable_mamba_extra_buffer:
+                    raise NotImplementedError(
+                        "UNO tree mode with --uno-draft-weight-quant does not track "
+                        "prefix-cache states; add --disable-radix-cache."
+                    )
+                tree_gdn = get_uno_tree_gdn(self.model_runner.req_to_token_pool)
+                tree_gdn.seed_in_tree = True
+                tree_gdn.seed_flag.zero_()
+                # Quantized drafts choose the layout per batch through the device
+                # flag; a bf16 seed-root draft (validation) stays fixed.
+                tree_gdn.dynamic = self.draft_weight_quant in ("fp8", "int4")
         if self._commits_mamba_state and get_exec().mamba.enable_mamba_extra_buffer:
             log_info_on_rank0(
                 logger,
@@ -296,7 +345,7 @@ class UnoWorkerV2(BaseSpecWorker):
         """Capture only the private F-wide tree-draft graph."""
 
         self._uno_draft_cuda_graph_runner = None
-        if not self.tree_mode or self.model_runner.decode_cuda_graph_runner is None:
+        if not self._private_draft or self.model_runner.decode_cuda_graph_runner is None:
             return None
         if self._uno_draft_attn_backend is None:
             raise RuntimeError(
@@ -312,14 +361,14 @@ class UnoWorkerV2(BaseSpecWorker):
         log_info_on_rank0(
             logger,
             "Capture UNO tree draft CUDA graph begin. "
-            f"num_tokens_per_req={self.forward_width}, "
+            f"num_tokens_per_req={self.draft_width}, "
             f"avail mem={before_mem:.2f} GB",
         )
         with self._bind_uno_draft_runtime():
             self._uno_draft_cuda_graph_runner = UnoDecodeCudaGraphRunner(
                 self.model_runner,
                 tree_draft_attn_backend=self._uno_draft_attn_backend,
-                tree_draft_width=self.forward_width,
+                tree_draft_width=self.draft_width,
             )
 
         after_mem = get_available_gpu_memory(
@@ -362,7 +411,7 @@ class UnoWorkerV2(BaseSpecWorker):
         """
 
         target_backend = self._target_worker.model_runner.attn_backend
-        if not self.tree_mode:
+        if not self._private_draft:
             return (target_backend,)
         return (target_backend, self._uno_draft_attn_backend)
 
@@ -450,6 +499,7 @@ class UnoWorkerV2(BaseSpecWorker):
         seq_lens_cpu: Optional[torch.Tensor],
         seq_lens_sum: Optional[int],
         req_pool_indices: torch.Tensor,
+        draft_token_num: Optional[int] = None,
     ) -> ForwardBatch:
         input_ids = input_ids.reshape(-1)
         positions = positions.reshape(-1)
@@ -458,7 +508,7 @@ class UnoWorkerV2(BaseSpecWorker):
         spec_info = UnoForwardInput(
             spec_input_type=spec_input_type,
             positions=positions,
-            draft_token_num=self.forward_width,
+            draft_token_num=draft_token_num or self.forward_width,
         )
 
         forward_batch = ForwardBatch(
@@ -505,7 +555,8 @@ class UnoWorkerV2(BaseSpecWorker):
         if logits is None:
             raise RuntimeError("UNO target block returned no next-token logits.")
 
-        expected_rows = forward_batch.batch_size * self.forward_width
+        width = getattr(forward_batch.spec_info, "draft_token_num", None) or self.forward_width
+        expected_rows = forward_batch.batch_size * width
         if logits.ndim != 2 or logits.shape[0] != expected_rows:
             raise RuntimeError(
                 "UNO target block returned an invalid logits shape: "
@@ -519,7 +570,7 @@ class UnoWorkerV2(BaseSpecWorker):
 
         predictions = torch.argmax(logits, dim=-1).view(
             forward_batch.batch_size,
-            self.forward_width,
+            width,
         )
         return result, predictions
 
@@ -705,33 +756,73 @@ class UnoWorkerV2(BaseSpecWorker):
         # verify starts from it and the verify commit replays seed + path.
 
         sampling_info = batch.sampling_info
-        if sampling_info.is_all_greedy:
-            clean_root_tokens = torch.argmax(
-                draft_logits[:, 0, :],
-                dim=-1,
-            )
+        # Seed-root only while the draft can read quantized weights (padding a
+        # graph batch only adds rows, which keeps the draft in bf16 beyond this).
+        seed_root = self.tree_seed_root and (
+            batch_size * self.forward_width <= self._tree_seed_root_max_rows
+        )
+        tree_gdn = get_uno_tree_gdn(self.model_runner.req_to_token_pool)
+        if tree_gdn is not None and tree_gdn.dynamic:
+            tree_gdn.seed_in_tree = seed_root
+            tree_gdn.seed_flag.fill_(0 if seed_root else 1)
+        if seed_root:
+            # The seed is the root (its KV and GDN state come from the verify) and
+            # the clean row is the first tree level, accepted like any other.
+            clean_root_tokens = None
+            tree_root_tokens = seed_tokens
+            tree_logits = draft_logits
         else:
-            clean_root_tokens = sample_uno_clean_root(
-                seed_tokens=seed_tokens,
-                draft_logits=draft_logits,
-                sampling_info=sampling_info,
-                max_top_k=draft_state.max_top_k,
-                uniform_top_k_value=draft_state.uniform_top_k_value,
-            )
+            if sampling_info.is_all_greedy:
+                clean_root_tokens = torch.argmax(
+                    draft_logits[:, 0, :],
+                    dim=-1,
+                )
+            else:
+                clean_root_tokens = sample_uno_clean_root(
+                    seed_tokens=seed_tokens,
+                    draft_logits=draft_logits,
+                    sampling_info=sampling_info,
+                    max_top_k=draft_state.max_top_k,
+                    uniform_top_k_value=draft_state.uniform_top_k_value,
+                )
+            self._sync_tp(clean_root_tokens=clean_root_tokens)
+            tree_root_tokens = clean_root_tokens
+            tree_logits = draft_logits[:, 1:, :]
 
-        self._sync_tp(clean_root_tokens=clean_root_tokens)
+        # Coupled root: the draft ranks its first-level candidates by score + G and
+        # the verify takes argmax(log p + G) at the root (an exact sample of p), so
+        # the first level is accepted with probability ~1 - TV(p, q) instead of the
+        # mass p puts on fixed candidates. Single rank, unseeded sampling only.
+        root_noise = None
+        if (
+            seed_root
+            and self.tree_coupled_root
+            and self.rectifier is not None
+            and self.forward_width > 1
+            and not sampling_info.is_all_greedy
+            and sampling_info.sampling_seed is None
+            and get_parallel().tp_size == 1
+        ):
+            root_noise = torch.empty(
+                (batch_size, draft_logits.size(-1)), dtype=torch.float32, device=self.device
+            ).exponential_().log_().neg_()
+
         rectified_children = None
         if self.rectifier is not None and self.forward_width > 1:
-            # Each tree node's children are rectified on the node's own token.
+            # Each tree node's children are rectified on the node's own token; the
+            # clean row (first level of a seed-root tree) is never rectified.
             rectified_children = self.rectifier.tree_children(
-                draft_logits=draft_logits[:, 1:, :],
-                root_tokens=clean_root_tokens,
+                draft_logits=tree_logits,
+                root_tokens=tree_root_tokens,
                 temperatures=sampling_info.temperatures,
                 top_k=self.candidate_top_k,
+                first_row_bias=not seed_root,
+                root_noise=root_noise,
+                noise_mass=self.tree_coupled_root >= 2,
             )
         proposal = build_uno_tree_proposal(
-            clean_root_tokens,
-            draft_logits[:, 1:, :],
+            tree_root_tokens,
+            tree_logits,
             max_nodes=self.verify_width,
             candidate_top_k=self.candidate_top_k,
             temperature=sampling_info.temperatures,
@@ -745,18 +836,20 @@ class UnoWorkerV2(BaseSpecWorker):
             draft_tokens=proposal.draft_tokens,
         )
 
-        # The first pass wrote the carried seed at C.  Give EAGLE a shallow
-        # batch whose KV-ready prefix is therefore C+1; its existing allocator
-        # assigns all Q tree slots at C+1 and its compactor can stay unchanged.
+        # Clean-root trees: the first pass wrote the carried seed at C, so EAGLE
+        # gets a shallow batch whose KV-ready prefix is C+1; its allocator assigns
+        # all Q tree slots at C+1 and its compactor can stay unchanged. Seed-root
+        # trees verify the seed too: the prefix is the committed C.
+        prefix_shift = 0 if seed_root else 1
         if self._commits_mamba_state:
             prepare_mamba_track_for_verify(batch)  # no-op without extra_buffer
         verify_batch = copy.copy(batch)
-        verify_batch.seq_lens = committed_seq_lens + 1
+        verify_batch.seq_lens = committed_seq_lens + prefix_shift
         if committed_seq_lens_cpu is None:
             verify_batch.seq_lens_cpu = None
             verify_batch.seq_lens_sum = None
         else:
-            verify_batch.seq_lens_cpu = committed_seq_lens_cpu + 1
+            verify_batch.seq_lens_cpu = committed_seq_lens_cpu + prefix_shift
             verify_batch.seq_lens_sum = int(verify_batch.seq_lens_cpu.sum())
 
         verify_input = build_eagle_verify_input(
@@ -768,7 +861,7 @@ class UnoWorkerV2(BaseSpecWorker):
             None,
             target_worker=self.target_worker,
             topk=self.candidate_top_k,
-            num_steps=self.tree_depth,
+            num_steps=self.tree_depth + (1 if seed_root else 0),
             num_draft_tokens=self.verify_width,
             tree_mask_mode=default_tree_mask_mode(),
             device=self.device,
@@ -795,6 +888,7 @@ class UnoWorkerV2(BaseSpecWorker):
             metadata_ready_pre_pad=False,
             finalize_tree_path=True,
             uno_target_max_top_k=draft_state.max_top_k,
+            uno_root_noise=root_noise,
         )
 
         packed = pack_uno_tree_result(
@@ -802,6 +896,7 @@ class UnoWorkerV2(BaseSpecWorker):
             eagle_predict=eagle_result.next_token_ids,
             eagle_accept_lens=eagle_result.accept_lens,
             draft_width=self.forward_width,
+            batch_size=batch_size,
         )
         new_seq_lens = eagle_result.new_seq_lens
         next_draft_input = UnoDraftInput(
@@ -822,7 +917,7 @@ class UnoWorkerV2(BaseSpecWorker):
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=self.forward_width,
             speculative_output_stride=self.forward_width + 1,
-            num_non_draft_tokens_per_req=2,
+            num_non_draft_tokens_per_req=1 if seed_root else 2,
             new_seq_lens=new_seq_lens,
             can_run_cuda_graph=eagle_result.can_run_cuda_graph,
             routed_experts_output=eagle_result.routed_experts_output,
@@ -864,6 +959,9 @@ class UnoWorkerV2(BaseSpecWorker):
             verify_seq_lens_cpu = committed_seq_lens_cpu + self.tail_width
             draft_seq_lens_sum = int(draft_seq_lens_cpu.sum())
             verify_seq_lens_sum = int(verify_seq_lens_cpu.sum())
+            # The draft pass itself spans draft_width rows (F with the seed in verify).
+            draft_pass_seq_lens_cpu = committed_seq_lens_cpu + self.draft_width
+            draft_pass_seq_lens_sum = int(draft_pass_seq_lens_cpu.sum())
         elif draft_state.reserved_seq_lens_cpu is not None:
             # Triton only needs a safe host planning bound. The allocator's
             # retained reservation avoids a D2H copy when FutureMap keeps the
@@ -872,11 +970,15 @@ class UnoWorkerV2(BaseSpecWorker):
             verify_seq_lens_cpu = draft_state.reserved_seq_lens_cpu
             draft_seq_lens_sum = draft_state.reserved_seq_lens_sum
             verify_seq_lens_sum = draft_state.reserved_seq_lens_sum
+            draft_pass_seq_lens_cpu = draft_seq_lens_cpu
+            draft_pass_seq_lens_sum = draft_seq_lens_sum
         else:
             draft_seq_lens_cpu = None
             verify_seq_lens_cpu = None
             draft_seq_lens_sum = None
             verify_seq_lens_sum = None
+            draft_pass_seq_lens_cpu = None
+            draft_pass_seq_lens_sum = None
 
         logical_positions = (
             committed_seq_lens.to(torch.int64)[:, None] + (self._tail_offsets[None, :])
@@ -899,19 +1001,20 @@ class UnoWorkerV2(BaseSpecWorker):
             )
         draft_input_ids = build_uno_draft_input(
             seed_tokens=seed_tokens,
-            forward_width=self.forward_width,
+            forward_width=self.draft_width,
             vocab_size=self.model_runner.model_config.vocab_size,
             **recycle_kwargs,
         )
         draft_forward_batch = self._make_forward_batch(
             spec_input_type=SpecInputType.UNO_DRAFT,
             input_ids=draft_input_ids,
-            positions=logical_positions[:, : self.forward_width],
-            out_cache_loc=tail_locs[:, : self.forward_width],
+            positions=logical_positions[:, : self.draft_width],
+            out_cache_loc=tail_locs[:, : self.draft_width],
             prefix_lens=committed_seq_lens,
-            seq_lens_cpu=draft_seq_lens_cpu,
-            seq_lens_sum=draft_seq_lens_sum,
+            seq_lens_cpu=draft_pass_seq_lens_cpu,
+            seq_lens_sum=draft_pass_seq_lens_sum,
             req_pool_indices=batch.req_pool_indices,
+            draft_token_num=self.draft_width,
         )
         sampling_info = batch.sampling_info
         all_greedy = sampling_info.is_all_greedy
@@ -921,13 +1024,28 @@ class UnoWorkerV2(BaseSpecWorker):
             draft_forward_batch,
             need_top1=all_greedy,
         )
-        if self._commits_mamba_state:
+        if self._commits_mamba_state and not self.seed_in_verify:
             # Only the seed row of the draft pass is a real token.
             self._commit_mamba_state(
                 batch=batch,
                 num_commit_rows=torch.ones(
                     batch_size, dtype=torch.int64, device=self.device
                 ),
+            )
+        if self.seed_in_verify:
+            return self._verify_with_seed_row(
+                batch=batch,
+                draft_result=draft_result,
+                draft_top1=candidates,
+                seed_tokens=seed_tokens,
+                committed_seq_lens=committed_seq_lens,
+                logical_positions=logical_positions,
+                tail_locs=tail_locs,
+                seq_lens_cpu=draft_seq_lens_cpu,
+                seq_lens_sum=draft_seq_lens_sum,
+                max_top_k=max_top_k,
+                uniform_top_k_value=uniform_top_k_value,
+                on_publish=on_publish,
             )
         if not all_greedy:
             draft_logits = draft_result.logits_output.next_token_logits.reshape(
@@ -1051,6 +1169,135 @@ class UnoWorkerV2(BaseSpecWorker):
             indexer_topk_output=verify_result.indexer_topk_output,
         )
 
+    def _verify_with_seed_row(
+        self,
+        *,
+        batch: ScheduleBatch,
+        draft_result,
+        draft_top1,
+        seed_tokens: torch.Tensor,
+        committed_seq_lens: torch.Tensor,
+        logical_positions: torch.Tensor,
+        tail_locs: torch.Tensor,
+        seq_lens_cpu,
+        seq_lens_sum,
+        max_top_k: int,
+        uniform_top_k_value,
+        on_publish,
+    ) -> GenerationBatchResult:
+        """Linear decode for --uno-draft-weight-quant: verify [seed, clean, drafts].
+
+        The draft pass (draft_width = F rows, [seed, noise x (F - 1)]) committed no
+        KV or recurrent state. The bf16 verify writes the seed row and accepts the
+        clean token by rejection sampling against its q, like the drafts; dropping
+        the seed column leaves the regular UNO result layout.
+        """
+        batch_size = len(committed_seq_lens)
+        block = self.block_width
+        sampling_info = batch.sampling_info
+        all_greedy = sampling_info.is_all_greedy
+        draft_logits = draft_result.logits_output.next_token_logits.reshape(
+            batch_size, self.draft_width, -1
+        )[:, :block, :]
+        if all_greedy:
+            candidates = draft_top1[:, :block]
+            if self.rectifier is not None:
+                candidates = rectify_uno_greedy_candidates(
+                    candidates=candidates,
+                    draft_logits=draft_logits,
+                    rectifier=self.rectifier,
+                )
+            draft_distribution = None
+        else:
+            candidates, draft_distribution = sample_uno_candidates(
+                draft_logits=draft_logits,
+                sampling_info=sampling_info,
+                max_top_k=max_top_k,
+                uniform_top_k_value=uniform_top_k_value,
+                rectifier=self.rectifier,
+                include_clean=True,
+            )
+        self._sync_tp(candidates=candidates)
+
+        verify_input = torch.cat(
+            (seed_tokens.to(candidates.dtype)[:, None], candidates), dim=1
+        )
+        verify_forward_batch = self._make_forward_batch(
+            spec_input_type=SpecInputType.UNO_VERIFY,
+            input_ids=verify_input,
+            positions=logical_positions[:, : self.forward_width],
+            out_cache_loc=tail_locs[:, : self.forward_width],
+            prefix_lens=committed_seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            seq_lens_sum=seq_lens_sum,
+            req_pool_indices=batch.req_pool_indices,
+        )
+        verify_result, target_top1 = self._run_target_block(
+            verify_forward_batch,
+            need_top1=all_greedy,
+        )
+        if all_greedy:
+            output_ids, accept_lens, new_seq_lens, correction = self._accept_and_pack(
+                candidates=verify_input,
+                target_top1=target_top1,
+                committed_seq_lens=committed_seq_lens,
+            )
+        else:
+            sampling_result = run_uno_sampling(
+                candidates=verify_input,
+                next_token_logits=verify_result.logits_output.next_token_logits,
+                sampling_info=sampling_info,
+                committed_frontiers=committed_seq_lens,
+                draft_distribution=draft_distribution,
+                max_top_k=max_top_k,
+                uniform_top_k_value=uniform_top_k_value,
+            )
+            output_ids = sampling_result.output_ids
+            accept_lens = sampling_result.accept_lens
+            new_seq_lens = sampling_result.new_seq_lens
+            correction = sampling_result.next_seed_tokens
+            self._sync_tp(
+                output_ids=output_ids,
+                accept_lens=accept_lens,
+                new_seq_lens=new_seq_lens,
+                correction=correction,
+            )
+        # The seed was emitted last step: drop its column and count. The result
+        # keeps the regular stride (tail_width); the trailing column is padding.
+        output_ids = torch.cat((output_ids[:, 1:], output_ids[:, :1].mul(0)), dim=1)
+        accept_lens = accept_lens - 1
+        new_seq_lens = new_seq_lens - 1
+
+        if self._commits_mamba_state:
+            # Verify rows 0..k: the seed and the accepted proposals.
+            self._commit_mamba_state(
+                batch=batch,
+                num_commit_rows=accept_lens.to(torch.int64),
+                track_from=committed_seq_lens.to(torch.int64),
+            )
+
+        next_draft_input = UnoDraftInput(
+            bonus_tokens=correction,
+            new_seq_lens=new_seq_lens,
+            forward_width=self.forward_width,
+        )
+        if on_publish is not None:
+            on_publish(new_seq_lens)
+        return GenerationBatchResult(
+            logits_output=verify_result.logits_output,
+            next_token_ids=output_ids.reshape(-1),
+            accept_lens=accept_lens,
+            next_draft_input=next_draft_input,
+            speculative_num_draft_tokens=self.forward_width,
+            speculative_output_stride=self.tail_width,
+            # The clean token is now a verified proposal; only the bonus is not.
+            num_non_draft_tokens_per_req=1,
+            new_seq_lens=new_seq_lens,
+            can_run_cuda_graph=verify_result.can_run_cuda_graph,
+            routed_experts_output=verify_result.routed_experts_output,
+            indexer_topk_output=verify_result.indexer_topk_output,
+        )
+
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
@@ -1097,7 +1344,7 @@ class UnoWorkerV2(BaseSpecWorker):
     def _linear_draft_window_context(self):
         """Linear UNO: read only the recent keys during the draft pass, never during the verify pass."""
 
-        if self._uno_draft_window <= 0 or self.tree_mode:
+        if self._uno_draft_window <= 0 or self._private_draft:
             yield
             return
         full = self._draft_window_backend(self.model_runner.attn_backend)
@@ -1117,12 +1364,12 @@ class UnoWorkerV2(BaseSpecWorker):
         self.lora_manager.reset_lora_batch()
         backend_context = (
             self._bind_uno_draft_runtime()
-            if self.tree_mode
+            if self._private_draft
             else contextlib.nullcontext()
         )
         attn_context = (
             forward_context(ForwardContext(attn_backend=self._uno_draft_attn_backend))
-            if self.tree_mode
+            if self._private_draft
             else contextlib.nullcontext()
         )
         # The eager runner plans through model_runner.attn_backend, while
@@ -1150,7 +1397,7 @@ class UnoWorkerV2(BaseSpecWorker):
             ):
                 self.lora_manager.prepare_lora_token_segments(
                     lora_ids=[None, self.uno_lora_id] * batch_size,
-                    segment_lens=[1, self.num_speculative_proposals] * batch_size,
+                    segment_lens=[1, self.draft_width - 1] * batch_size,
                 )
             result = self._run_target_block(
                 forward_batch,
