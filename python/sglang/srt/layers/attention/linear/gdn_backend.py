@@ -1,3 +1,4 @@
+import os
 from typing import Optional, Tuple, Union
 
 import msgspec
@@ -104,6 +105,16 @@ def _verify_replayssm_launch(spec_info, batch_size: int, head_k_dim: int) -> dic
         return {"block_v": 64, "num_warps": 2, "nk": 4 if wide else 2}
     # tl.dot needs K chunks of at least 16 (K is padded to a power of two).
     nk = 4 if head_k_dim > 32 else 2
+    # UNO_RSSM_NK8=1 (default off): a 9..16-token verify window (seed-in-verify, e.g. linear B8's
+    # 9 rows) runs 16-row tiles, where eight K chunks are fastest at batch 8: 9 tokens
+    # 26.5 -> 23.3 us per layer (8 tokens in 8-row tiles stay at nk 4, 13.7 us).
+    if (
+        os.environ.get("UNO_RSSM_NK8", "0") == "1"
+        and spec_info.spec_input_type == SpecInputType.UNO_VERIFY
+        and head_k_dim >= 128
+        and 8 < int(getattr(spec_info, "draft_token_num", 0) or 0) <= 16  # window width
+    ):
+        nk = 8
     return {"block_v": 128, "num_warps": 2, "nk": nk}
 
 
