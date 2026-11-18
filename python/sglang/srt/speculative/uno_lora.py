@@ -329,9 +329,12 @@ def _quantize_uno_fused(manager: LoRAManager, kind: str) -> None:
         # Up to 32 rows (c <= 4 with F = 8): steady per cycle c=2 26.2 vs 26.4 ms,
         # c=4 29.3 vs 29.5 ms against the bf16 lm_head; 36-row (old 9-row draft)
         # c=4 blocks were slower with Marlin (32.6 vs 31.7 ms).
+        # With a Humming INT4 draft kernel the quantized lm_head also wins at 64+
+        # rows (Hopper wgmma), so its default limit follows the GEMMs' (256).
+        humming = lm_head.uno_draft_weight.humming is not None
         lm_head.uno_draft_weight.max_rows = min(
             lm_head.uno_draft_weight.max_rows,
-            int(os.environ.get("UNO_DRAFT_LM_HEAD_MAX_ROWS", "32")),
+            int(os.environ.get("UNO_DRAFT_LM_HEAD_MAX_ROWS", "256" if humming else "32")),
         )
         lm_head_bytes = lm_head.uno_draft_weight.nbytes()
     torch.cuda.empty_cache()

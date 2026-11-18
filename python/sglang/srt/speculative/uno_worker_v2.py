@@ -144,11 +144,11 @@ class UnoWorkerV2(BaseSpecWorker):
             int(os.environ.get("UNO_TREE_COUPLED_ROOT", "2")) if self.tree_seed_root else 0
         )
         if self.tree_mode and self.draft_weight_quant in ("fp8", "int4"):
-            from sglang.srt.speculative.uno_draft_quant import _DEFAULT_MAX_ROWS
+            from sglang.srt.speculative.uno_draft_quant import default_max_rows
 
             self._tree_seed_root_max_rows = int(
                 os.environ.get(
-                    "UNO_DRAFT_QUANT_MAX_ROWS", _DEFAULT_MAX_ROWS[self.draft_weight_quant]
+                    "UNO_DRAFT_QUANT_MAX_ROWS", default_max_rows(self.draft_weight_quant)
                 )
             )
         self.block_width = (

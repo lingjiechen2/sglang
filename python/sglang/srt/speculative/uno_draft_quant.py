@@ -11,9 +11,12 @@ committed tokens still follow the target model exactly.
 
 from __future__ import annotations
 
+import logging
 import os
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 UNO_DRAFT_WEIGHT_QUANT_KINDS = ("none", "bf16", "fp8", "int4")
 
@@ -23,6 +26,100 @@ _FP8_MAX = 448.0
 # 12.7 / 13.4 ms at M = 8 / 64; FP8 8.1 ms at M = 8, 13.7 ms at M = 64. Larger draft
 # batches fall back to the bf16 folded GEMM. UNO_DRAFT_QUANT_MAX_ROWS overrides.
 _DEFAULT_MAX_ROWS = {"int4": 64, "fp8": 48}
+
+# INT4 draft GEMM kernel, from --uno-draft-int4-kernel (UNO_DRAFT_INT4_KERNEL overrides):
+#
+#   "fit" (default) Pick ONE kernel at startup from this server's peak draft row count,
+#                   max_running_requests * speculative_num_draft_tokens: Marlin below
+#                   UNO_DRAFT_HUMMING_MIN_ROWS rows, Humming from there on. Only the chosen
+#                   kernel's packing is built, so the server holds one INT4 copy. A server
+#                   launched at concurrency 1 with B8 drafts 8 rows and gets Marlin; at
+#                   concurrency 8 it drafts 64 rows and gets Humming.
+#   "marlin"        Always Marlin.
+#   "humming"       Always Humming (Marlin's packing is dropped after it is built).
+#   "auto"          Build BOTH packings and dispatch per CUDA graph on the actual row count.
+#                   Optimal at every row count one server sees -- an in-flight count that
+#                   dips to 1-3 during ramp-up and the tail still gets Marlin -- but it
+#                   costs two INT4 copies (measured 25.2 GB vs 12.6 GB of draft weights on
+#                   Qwen3.8-27B skip75). The 11-16 c=8 ladder and the 11-18 c=1 A/B were
+#                   both measured in this mode; against "humming" at c=8 the difference is
+#                   the 3.0% of decode steps with 1-3 requests in flight, ~0.5% of decode
+#                   time (estimated from the in-flight histogram, not measured directly).
+#
+# Humming gets the same GPTQ codes and scales as Marlin, so W4A16 Humming and Marlin agree
+# bit for bit and the kernel choice never moves the acceptance length. On H200 with the
+# Qwen3.8-27B folded draft shapes, one forward's draft GEMMs: Marlin 4.69 / 7.06 / 11.26 /
+# 21.65 ms vs Humming 5.54 / 6.54 / 8.33 / 10.95 ms at 8 / 32 / 64 / 128 rows -- hence the
+# 32-row crossover below. With Humming the INT4 draft also beats the bf16 GEMM (13.9 ms)
+# above 64 rows, so the row limit rises to 256.
+_INT4_KERNEL_CHOICES = ("fit", "marlin", "humming", "auto")
+_HUMMING_MIN_ROWS = int(os.environ.get("UNO_DRAFT_HUMMING_MIN_ROWS", "32"))
+_RESOLVED_INT4_KERNEL: str | None = None
+
+
+def _int4_kernel_setting() -> str:
+    """The requested setting: UNO_DRAFT_INT4_KERNEL, else --uno-draft-int4-kernel."""
+    setting = os.environ.get("UNO_DRAFT_INT4_KERNEL")
+    if setting is None:
+        from sglang.srt.runtime_context import get_spec
+
+        setting = getattr(get_spec(), "uno_draft_int4_kernel", "fit")
+    if setting not in _INT4_KERNEL_CHOICES:
+        raise ValueError(
+            f"UNO_DRAFT_INT4_KERNEL must be one of {_INT4_KERNEL_CHOICES}, got {setting!r}"
+        )
+    return setting
+
+
+def peak_draft_rows() -> int | None:
+    """Largest draft row count this server can issue, or None when it cannot be read.
+
+    Reads already-parsed server args, so it does not depend on init order. Returns None
+    when max_running_requests is unset (the scheduler then sizes it from free memory and
+    the peak is effectively unbounded).
+    """
+    from sglang.srt.runtime_context import get_schedule, get_spec
+
+    concurrency = getattr(get_schedule(), "max_running_requests", None)
+    width = getattr(get_spec(), "speculative_num_draft_tokens", None)
+    if not concurrency or not width:
+        return None
+    return int(concurrency) * int(width)
+
+
+def int4_kernel() -> str:
+    """Which INT4 kernel this server uses: "marlin", "humming", or "auto" (both built)."""
+    global _RESOLVED_INT4_KERNEL
+    if _RESOLVED_INT4_KERNEL is not None:
+        return _RESOLVED_INT4_KERNEL
+    setting = _int4_kernel_setting()
+    if setting != "fit":
+        _RESOLVED_INT4_KERNEL = setting
+        return _RESOLVED_INT4_KERNEL
+    rows = peak_draft_rows()
+    # Unbounded concurrency: the server can go wide, so take the kernel that wins there.
+    resolved = "humming" if rows is None or rows >= _HUMMING_MIN_ROWS else "marlin"
+    _RESOLVED_INT4_KERNEL = resolved
+    logger.info(
+        "UNO draft INT4 kernel: %s (peak draft rows %s, crossover %d); "
+        "pass --uno-draft-int4-kernel to choose explicitly.",
+        resolved,
+        rows if rows is not None else "unbounded (max_running_requests unset)",
+        _HUMMING_MIN_ROWS,
+    )
+    return resolved
+# The Humming draft GEMMs are weight-only: INT4 weights, bf16 activations (W4A16). A W4A8
+# variant (UNO_DRAFT_INT4_ACT=int8, per-row int8 activations on the int8 wgmma path) was
+# measured and dropped on 2026-11-18: it cut one forward's draft GEMMs from 7.49 to 6.52 ms
+# at 64 rows but cost ~1.8-2% acceptance length, and nothing shipped with it on.
+_HUMMING_MAX_ROWS = 256
+
+
+def default_max_rows(kind: str) -> int:
+    """Largest draft row count that reads the quantized weight (bf16 above it)."""
+    if kind == "int4" and int4_kernel() in ("humming", "auto"):
+        return _HUMMING_MAX_ROWS
+    return _DEFAULT_MAX_ROWS[kind]
 
 # INT4 Marlin launch configs for the draft GEMMs: (N, K) -> {rows bucket:
 # (pipeline stages, thread_k, thread_n, threads, blocks per SM)}; thread_k = -1
@@ -71,6 +168,108 @@ _INT4_MARLIN_LAUNCH = {
 }
 _LAUNCH_ROW_BUCKETS = (8, 16, 32, 64)
 _MAX_BLOCKS_PER_SM = 4
+
+# Humming tuning configs for the draft GEMMs in the row bucket (56, 64] (linear B8
+# at 8 running requests drafts 64 rows): (N, K) -> Humming TuningConfig. Humming's
+# own sm90 heuristic picks block (64, 256, 64) / warp (64, 32, 64) with stream-K for
+# every shape. A sweep over tile geometry, pipeline stages, CTAs per SM, stream-K,
+# raster order and activation multicast on H200 (Qwen3.8-27B folded draft shapes,
+# 6 weight copies per shape in one CUDA graph) cut one forward's draft GEMMs from
+# 8.30 to 7.49 ms at 64 rows. Other row buckets keep the heuristic; the table is
+# used only on 132-SM devices (num_sms is part of each config).
+# UNO_DRAFT_HUMMING_TUNED=0 disables it.
+_HUMMING_TUNED_ROWS = 64
+_HUMMING_TUNED_SMS = 132
+_HUMMING_COMMON = {
+    "use_f16_accum": False,
+    "use_warp_spec": True,
+    "use_tma": True,
+    "use_mbarrier": True,
+    "num_sms": _HUMMING_TUNED_SMS,
+    "multi_cast_size_a": 1,
+}
+_HUMMING_TUNED = {
+    (14464, 5120): dict(  # attention qkv: 27.0 -> 23.9 us
+        _HUMMING_COMMON, block_shape=[64, 128, 128], warp_shape=[64, 32, 64], use_stream_k=False,
+        num_stages=5, num_ctas_per_sm=1, raster_group_m=1, reduce_overlap_last_stage_only=True,
+    ),
+    (16640, 5120): dict(  # GDN in_proj: 28.7 -> 24.2 us
+        _HUMMING_COMMON, block_shape=[64, 128, 128], warp_shape=[64, 32, 64], use_stream_k=False,
+        num_stages=5, num_ctas_per_sm=1, raster_group_m=1, reduce_overlap_last_stage_only=False,
+    ),
+    (5248, 6144): dict(  # attention o_proj, GDN out_proj: 15.9 -> 15.3 us
+        _HUMMING_COMMON, block_shape=[64, 128, 128], warp_shape=[64, 32, 64], use_stream_k=True,
+        num_stages=4, num_ctas_per_sm=1, raster_group_m=1, reduce_overlap_last_stage_only=True,
+    ),
+    (34944, 5120): dict(  # MLP gate_up: 54.0 -> 48.0 us
+        _HUMMING_COMMON, block_shape=[64, 256, 64], warp_shape=[64, 64, 64], use_stream_k=True,
+        num_stages=3, num_ctas_per_sm=2, raster_group_m=77, reduce_overlap_last_stage_only=True,
+    ),
+    (5248, 17408): dict(  # MLP down: 31.4 -> 29.7 us
+        _HUMMING_COMMON, block_shape=[64, 128, 128], warp_shape=[64, 32, 64], use_stream_k=True,
+        num_stages=4, num_ctas_per_sm=1, raster_group_m=22, reduce_overlap_last_stage_only=True,
+    ),
+    (248320, 5120): dict(  # draft lm_head (once per forward): 351 -> 286 us
+        _HUMMING_COMMON, block_shape=[64, 512, 64], warp_shape=[64, 64, 64], use_stream_k=True,
+        num_stages=6, num_ctas_per_sm=1, raster_group_m=1, reduce_overlap_last_stage_only=True,
+    ),
+    # Rank-0 folds of skip-adapter layers (UNO_DRAFT_QUANT_SKIPPED), own sweep at 64 rows
+    # (multicast winners left out). qkv / o / in_proj rank-0 shapes keep the folded-shape configs
+    # (same winners); MLP shapes differ:
+    (34816, 5120): dict(  # MLP gate_up, rank 0: heuristic 54.0 -> 46.4 us
+        _HUMMING_COMMON, block_shape=[64, 512, 64], warp_shape=[64, 64, 64], use_stream_k=True,
+        num_stages=6, num_ctas_per_sm=1, raster_group_m=1, reduce_overlap_last_stage_only=True,
+    ),
+    (5120, 17408): dict(  # MLP down, rank 0: heuristic 30.7 -> 28.5 us
+        _HUMMING_COMMON, block_shape=[64, 256, 64], warp_shape=[64, 32, 64], use_stream_k=True,
+        num_stages=6, num_ctas_per_sm=1, raster_group_m=1, reduce_overlap_last_stage_only=True,
+    ),
+}
+
+
+# Extra tuned row buckets: (rows, channel scales) -> {(N, K): config}. Linear B7 at 8
+# running requests drafts 56 rows, which falls in Humming's (48, 56] bucket. Filled from sweeps.
+#
+# Empty: every entry here came from the W4A8 sweeps, dropped with W4A8 on 2026-11-18. The
+# lookup below is kept as the extension point for a future W4A16 sweep of another bucket.
+_HUMMING_TUNED_EXTRA: dict = {}
+
+
+def _humming_tuning(layer, n: int, k: int, channel: bool = False):
+    """JSON tuning table for this Humming layer with the tuned (56, 64] bucket (plus any
+    extra tuned buckets), or None."""
+    if os.environ.get("UNO_DRAFT_HUMMING_TUNED", "1") == "0":
+        return None
+    # Per-channel scales (UnoMarlinDraftWeight.group = 0) have no W4A16 table: the only sweeps
+    # run for them were W4A8, dropped on 2026-11-18. They fall back to Humming's sm90 heuristic.
+    table = {} if channel else _HUMMING_TUNED
+    # A base-only (rank 0) fold of a layer the adapter skips is the folded shape minus its
+    # LoRA-A rows (128 per block); the tiles of the folded shape divide it as well.
+    def lookup(tab):
+        for extra_rows in (0, 128, 256):
+            if (n + extra_rows, k) in tab:
+                return tab[(n + extra_rows, k)]
+        return None
+
+    picks = [(_HUMMING_TUNED_ROWS, lookup(table))]
+    for (rows, ch), extra in _HUMMING_TUNED_EXTRA.items():
+        if ch == channel:
+            picks.append((rows, lookup(extra)))
+    picks = [(rows, cfg) for rows, cfg in picks if cfg is not None]
+    sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    if not picks or sms != _HUMMING_TUNED_SMS:
+        return None
+    import json
+
+    from humming.tune import get_heuristics_config
+
+    table = [list(entry) for entry in get_heuristics_config(layer.humming_config)]
+    for rows, cfg in picks:
+        hits = [e for e in table if e[0] < rows <= e[1]]
+        if len(hits) != 1:
+            return None
+        hits[0][2] = dict(cfg)
+    return json.dumps(table)
 
 
 def _int4_marlin_launch(n: int, k: int, rows: int):
@@ -173,8 +372,14 @@ def _gptq_int4(weight: torch.Tensor, hessian: torch.Tensor, group: int, dtype, b
 class UnoMarlinDraftWeight:
     """A weight-only Marlin copy of a ``[N, K]`` bf16 weight; ``__call__(x) == x @ W.T``."""
 
-    # INT4 scale group along K; UNO_DRAFT_INT4_GROUP overrides (Marlin: 32, 64, 128).
-    group = int(os.environ.get("UNO_DRAFT_INT4_GROUP", "128"))
+    # INT4 scale group along K (Marlin accepts 32, 64, 128). 0 would mean one scale per
+    # output channel -- GPTQ over all of K, Humming CHANNEL scales -- and is still honoured
+    # if set in code, but it is no longer a user-facing knob: UNO_DRAFT_INT4_GROUP was
+    # removed on 2026-11-18 along with W4A8. Per-channel scales only ever won on the W4A8
+    # path, where the int8 kernel could accumulate int32 over all of K and rescale once
+    # instead of once per group (one forward 6.31 vs 6.72 ms). On the W4A16 path they just
+    # lose accuracy and have no tuned table, so 128 is the only sensible value.
+    group = 128
 
     def __init__(
         self,
@@ -193,10 +398,14 @@ class UnoMarlinDraftWeight:
         if kind not in ("fp8", "int4"):
             raise ValueError(f"No quantized UNO draft weight for {kind!r}")
         self.kind = kind
-        self.max_rows = int(os.environ.get("UNO_DRAFT_QUANT_MAX_ROWS", _DEFAULT_MAX_ROWS[kind]))
+        self.max_rows = int(os.environ.get("UNO_DRAFT_QUANT_MAX_ROWS", default_max_rows(kind)))
+        self.humming = None
+        self.humming_tuning = None
         self.out_features = weight.size(0)
         weight = _pad_rows(weight.detach(), 64)
         self.n, self.k = weight.shape
+        self.group = self.k if type(self).group == 0 else type(self).group
+        self.channel = self.group == self.k
         if self.k % self.group:
             raise ValueError(f"Marlin draft weights need K % {self.group} == 0, got K={self.k}")
         device = weight.device
@@ -249,6 +458,58 @@ class UnoMarlinDraftWeight:
                 if hessian is not None and cache_path is not None:
                     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
                     torch.save({"qweight": self.qweight, "scales": self.scales}, cache_path)
+            kernel = int4_kernel()
+            if kernel in ("humming", "auto"):
+                self.humming_min_rows = 0 if kernel == "humming" else _HUMMING_MIN_ROWS
+                self.humming = self._build_humming(weight.dtype)
+                if self.humming_min_rows == 0:
+                    self.qweight = self.scales = None  # Marlin copy no longer read
+
+    def gptq_codes(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """The INT4 codes [K, N] in [0, 16) and group scales [K / group, N] behind
+        the Marlin tensors: scales un-permuted, codes read back from Marlin itself
+        (identity rows give (q - 8) * s exactly in bf16)."""
+        from sglang.srt.layers.quantization.marlin_utils import get_scale_perms
+
+        perm = torch.tensor(get_scale_perms()[1 if self.channel else 0], device=self.scales.device)
+        scales = self.scales.reshape(-1, perm.numel())[:, torch.argsort(perm)].reshape(-1, self.n)
+        codes = torch.empty(self.k, self.n, dtype=torch.int32, device=scales.device)
+        step = 512
+        for i in range(0, self.k, step):
+            rows = min(step, self.k - i)
+            eye = torch.zeros(rows, self.k, dtype=scales.dtype, device=scales.device)
+            eye[torch.arange(rows), i + torch.arange(rows)] = 1
+            deq = self._gemm(eye).float()  # [rows, N] = (q - 8) * s
+            s = scales[(i + torch.arange(rows, device=scales.device)) // self.group].float()
+            codes[i : i + rows] = (deq / s).round().clamp(-8, 7).to(torch.int32) + 8
+        return codes, scales
+
+    def _build_humming(self, dtype) -> torch.nn.Module:
+        from humming.layer import HummingLayer
+
+        codes, scales = self.gptq_codes()
+        if self.channel:
+            # Humming's own schema: uint4 codes (zero at 8, as GPTQ sym) packed along K, [N, 1] scales.
+            weight_config = {"quant_method": "humming", "dtype": "int4", "group_size": 0}
+            tensors = {
+                "weight": _pack_int4_rows(codes).t().contiguous(),
+                "weight_scale": scales.t().contiguous().to(dtype),
+            }
+        else:
+            weight_config = {"quant_method": "gptq", "bits": 4, "group_size": self.group, "sym": True}
+            tensors = {"qweight": _pack_int4_rows(codes), "scales": scales.to(dtype)}
+        layer = HummingLayer(
+            shape_n=self.n,
+            shape_k=self.k,
+            weight_config=weight_config,
+            input_config=None,  # weight-only: bf16 activations (W4A16)
+            torch_dtype=dtype,
+            pad_n_to_multiple=256,  # Humming's N tiles must divide N
+        ).to(scales.device)
+        layer.load_from_tensors(tensors)
+        layer.transform()
+        self.humming_tuning = _humming_tuning(layer, self.n, self.k, channel=self.channel)
+        return layer
 
     def _gemm(self, x: torch.Tensor, out=None) -> torch.Tensor:
         from sglang.kernels.ops.gemm.gptq_marlin import gptq_marlin_gemm, gptq_marlin_gemm_cfg
@@ -269,10 +530,19 @@ class UnoMarlinDraftWeight:
         )
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        y = self._gemm(x)
+        # Row count is fixed per captured graph, so the kernel choice is static too.
+        if self.humming is not None and x.size(0) >= self.humming_min_rows:
+            if self.humming_tuning is not None:
+                y = self.humming(x, tuning_config=self.humming_tuning)
+            else:
+                y = self.humming(x)
+        else:
+            y = self._gemm(x)
         # Consumers read rows through stride(0), so the padded columns stay a view.
-        return y if self.n == self.out_features else y[:, : self.out_features]
+        return y if y.size(1) == self.out_features else y[:, : self.out_features]
 
     def nbytes(self) -> int:
-        return (self.qweight.numel() * self.qweight.element_size()
-                + self.scales.numel() * self.scales.element_size())
+        total = sum(t.numel() * t.element_size() for t in (self.qweight, self.scales) if t is not None)
+        if self.humming is not None:
+            total += sum(p.numel() * p.element_size() for p in self.humming.parameters())
+        return total

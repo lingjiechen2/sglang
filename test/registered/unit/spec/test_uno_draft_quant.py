@@ -51,6 +51,100 @@ class TestUnoDraftQuant(CustomTestCase):
         self.assertLess(err_ref, 0.01)  # bf16 output rounding only
         self.assertLess(err_full, 0.15)  # int4 noise, not a wrong layout
 
+    def test_humming_reads_the_marlin_gptq_codes(self):
+        try:
+            import humming  # noqa: F401
+        except ImportError:
+            self.skipTest("humming-kernels not installed")
+        w = UnoMarlinDraftWeight(self.weight, "int4")
+        codes, scales = w.gptq_codes()
+        deq = ((codes.float() - 8) * scales.float().repeat_interleave(w.group, dim=0)).t()[:700]
+        ref_w = _int4_reference(self.weight, w.group)
+        torch.testing.assert_close(deq, ref_w, rtol=0, atol=1e-6)  # exact codes and scales
+        layer = w._build_humming(torch.bfloat16)
+        for m in (8, 64):
+            x = torch.randn(m, 1024, device=_DEVICE, dtype=torch.bfloat16)
+            got = layer(x)[:, :700].float()
+            ref = w._gemm(x)[:, :700].float()
+            err = ((got - ref).norm() / ref.norm()).item()
+            print(f"humming vs marlin M={m} rel diff {err:.5f}")
+            self.assertLess(err, 0.01)  # same codes, only accumulation order differs
+
+    def test_humming_tuned_bucket_matches_heuristic(self):
+        try:
+            import humming  # noqa: F401
+        except ImportError:
+            self.skipTest("humming-kernels not installed")
+        import json
+        from unittest import mock
+
+        import sglang.srt.speculative.uno_draft_quant as q
+
+        if torch.cuda.get_device_properties(0).multi_processor_count != q._HUMMING_TUNED_SMS:
+            self.skipTest("tuned Humming table is for 132-SM devices")
+        w = UnoMarlinDraftWeight(self.weight, "int4")
+        cfg = dict(q._HUMMING_TUNED[(16640, 5120)])  # block (64, 128, 128): legal for N=704, K=1024
+        with mock.patch.dict(q._HUMMING_TUNED, {(w.n, w.k): cfg}):
+            layer = w._build_humming(torch.bfloat16)
+        table = json.loads(w.humming_tuning)
+        tuned = [e for e in table if e[2].get("block_shape") == cfg["block_shape"] and e[2].get("num_stages") == 5]
+        self.assertEqual(len(tuned), 1)  # only the (56, 64] bucket is replaced
+        self.assertTrue(tuned[0][0] < 64 <= tuned[0][1])
+        for m in (48, 64):
+            x = torch.randn(m, 1024, device=_DEVICE, dtype=torch.bfloat16)
+            got = layer(x, tuning_config=w.humming_tuning)[:, :700].float()
+            ref = layer(x)[:, :700].float()
+            err = ((got - ref).norm() / ref.norm()).item()
+            print(f"humming tuned vs heuristic M={m} rel diff {err:.5f}")
+            self.assertLess(err, 0.01)  # same codes, only tile order / split-K differ
+
+    def test_humming_channel_scales_read_the_marlin_codes(self):
+        try:
+            import humming  # noqa: F401
+        except ImportError:
+            self.skipTest("humming-kernels not installed")
+        from unittest import mock
+
+        with mock.patch.object(UnoMarlinDraftWeight, "group", 0):  # per-channel scales
+            w = UnoMarlinDraftWeight(self.weight, "int4")
+        self.assertTrue(w.channel)
+        self.assertEqual(w.group, 1024)
+        codes, scales = w.gptq_codes()
+        self.assertEqual(tuple(scales.shape), (1, w.n))
+        deq = ((codes.float() - 8) * scales.float()).t()[:700]
+        torch.testing.assert_close(deq, _int4_reference(self.weight, 1024), rtol=0, atol=1e-6)
+        layer = w._build_humming(torch.bfloat16)
+        for m in (8, 64):
+            x = torch.randn(m, 1024, device=_DEVICE, dtype=torch.bfloat16)
+            got = layer(x)[:, :700].float()
+            ref = w._gemm(x)[:, :700].float()  # Marlin, channel-wise scales
+            err = ((got - ref).norm() / ref.norm()).item()
+            print(f"humming channel vs marlin M={m} rel diff {err:.5f}")
+            self.assertLess(err, 0.01)
+
+    def test_rank0_fold_is_the_quantized_base_gemm(self):
+        # UNO_DRAFT_QUANT_SKIPPED: a layer the adapter skips folds with rank 0 (no LoRA expand).
+        import torch.nn.functional as F
+
+        n = 1024
+        w = (torch.randn(2 * n, 1024, device=_DEVICE) * 0.02).to(torch.bfloat16)
+        empty = torch.zeros(0, dtype=torch.int32, device=_DEVICE)
+        fused = UnoFusedLoRA(
+            weight_cat=w, lora_b=torch.zeros(2 * n, 0, device=_DEVICE, dtype=torch.bfloat16),
+            slice_ends=empty, slice_blocks=empty, num_slices=2, num_blocks=1, out_features=2 * n,
+            rank=0, scaling=1.0, out_splits=(2 * n,), gate_up_blocks=(0, 0),
+            draft_weight=UnoMarlinDraftWeight(w, "int4"),
+        )
+        x = torch.randn(64, 1024, device=_DEVICE, dtype=torch.bfloat16)
+        base = fused.draft_weight(x).float()
+        got = fused.forward(x, forward_width=8).float()
+        torch.testing.assert_close(got, base, rtol=0, atol=0)
+        act = fused.forward_silu_mul(x, forward_width=8).float()
+        ref = F.silu(base[:, :n]) * base[:, n:]
+        err = ((act - ref).norm() / ref.norm()).item()
+        print(f"rank-0 fold silu_mul rel diff {err:.5f}")
+        self.assertLess(err, 0.01)
+
     def test_fp8_close_to_bf16(self):
         got = UnoMarlinDraftWeight(self.weight, "fp8")(self.x).float()
         full = self.x.float() @ self.weight.float().t()
