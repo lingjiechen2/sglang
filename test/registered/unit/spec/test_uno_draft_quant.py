@@ -98,30 +98,6 @@ class TestUnoDraftQuant(CustomTestCase):
             print(f"humming tuned vs heuristic M={m} rel diff {err:.5f}")
             self.assertLess(err, 0.01)  # same codes, only tile order / split-K differ
 
-    def test_humming_channel_scales_read_the_marlin_codes(self):
-        try:
-            import humming  # noqa: F401
-        except ImportError:
-            self.skipTest("humming-kernels not installed")
-        from unittest import mock
-
-        with mock.patch.object(UnoMarlinDraftWeight, "group", 0):  # per-channel scales
-            w = UnoMarlinDraftWeight(self.weight, "int4")
-        self.assertTrue(w.channel)
-        self.assertEqual(w.group, 1024)
-        codes, scales = w.gptq_codes()
-        self.assertEqual(tuple(scales.shape), (1, w.n))
-        deq = ((codes.float() - 8) * scales.float()).t()[:700]
-        torch.testing.assert_close(deq, _int4_reference(self.weight, 1024), rtol=0, atol=1e-6)
-        layer = w._build_humming(torch.bfloat16)
-        for m in (8, 64):
-            x = torch.randn(m, 1024, device=_DEVICE, dtype=torch.bfloat16)
-            got = layer(x)[:, :700].float()
-            ref = w._gemm(x)[:, :700].float()  # Marlin, channel-wise scales
-            err = ((got - ref).norm() / ref.norm()).item()
-            print(f"humming channel vs marlin M={m} rel diff {err:.5f}")
-            self.assertLess(err, 0.01)
-
     def test_rank0_fold_is_the_quantized_base_gemm(self):
         # UNO_DRAFT_QUANT_SKIPPED: a layer the adapter skips folds with rank 0 (no LoRA expand).
         import torch.nn.functional as F

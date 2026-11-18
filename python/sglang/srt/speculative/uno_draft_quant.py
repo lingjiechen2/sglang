@@ -304,49 +304,30 @@ _HUMMING_TUNED = {
 }
 
 
-# Extra tuned row buckets: (rows, channel scales) -> {(N, K): config}. Linear B7 at 8
-# running requests drafts 56 rows, which falls in Humming's (48, 56] bucket. Filled from sweeps.
-#
-# Empty: every entry here came from the W4A8 sweeps, dropped with W4A8 on 2026-11-18. The
-# lookup below is kept as the extension point for a future W4A16 sweep of another bucket.
-_HUMMING_TUNED_EXTRA: dict = {}
-
-
-def _humming_tuning(layer, n: int, k: int, channel: bool = False):
-    """JSON tuning table for this Humming layer with the tuned (56, 64] bucket (plus any
-    extra tuned buckets), or None."""
+def _humming_tuning(layer, n: int, k: int):
+    """Humming's heuristic table with the tuned (56, 64] bucket replaced, as JSON, or None."""
     if os.environ.get("UNO_DRAFT_HUMMING_TUNED", "1") == "0":
         return None
-    # Per-channel scales (UnoMarlinDraftWeight.group = 0) have no W4A16 table: the only sweeps
-    # run for them were W4A8, dropped on 2026-11-18. They fall back to Humming's sm90 heuristic.
-    table = {} if channel else _HUMMING_TUNED
     # A base-only (rank 0) fold of a layer the adapter skips is the folded shape minus its
     # LoRA-A rows (128 per block); the tiles of the folded shape divide it as well.
-    def lookup(tab):
-        for extra_rows in (0, 128, 256):
-            if (n + extra_rows, k) in tab:
-                return tab[(n + extra_rows, k)]
-        return None
-
-    picks = [(_HUMMING_TUNED_ROWS, lookup(table))]
-    for (rows, ch), extra in _HUMMING_TUNED_EXTRA.items():
-        if ch == channel:
-            picks.append((rows, lookup(extra)))
-    picks = [(rows, cfg) for rows, cfg in picks if cfg is not None]
+    cfg = None
+    for extra_rows in (0, 128, 256):
+        cfg = _HUMMING_TUNED.get((n + extra_rows, k))
+        if cfg is not None:
+            break
     sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
-    if not picks or sms != _HUMMING_TUNED_SMS:
+    if cfg is None or sms != _HUMMING_TUNED_SMS:
         return None
     import json
 
     from humming.tune import get_heuristics_config
 
-    table = [list(entry) for entry in get_heuristics_config(layer.humming_config)]
-    for rows, cfg in picks:
-        hits = [e for e in table if e[0] < rows <= e[1]]
-        if len(hits) != 1:
-            return None
-        hits[0][2] = dict(cfg)
-    return json.dumps(table)
+    buckets = [list(entry) for entry in get_heuristics_config(layer.humming_config)]
+    hits = [b for b in buckets if b[0] < _HUMMING_TUNED_ROWS <= b[1]]
+    if len(hits) != 1:
+        return None
+    hits[0][2] = dict(cfg)
+    return json.dumps(buckets)
 
 
 def _int4_marlin_launch(n: int, k: int, rows: int):
@@ -449,13 +430,11 @@ def _gptq_int4(weight: torch.Tensor, hessian: torch.Tensor, group: int, dtype, b
 class UnoMarlinDraftWeight:
     """A weight-only Marlin copy of a ``[N, K]`` bf16 weight; ``__call__(x) == x @ W.T``."""
 
-    # INT4 scale group along K (Marlin accepts 32, 64, 128). 0 would mean one scale per
-    # output channel -- GPTQ over all of K, Humming CHANNEL scales -- and is still honoured
-    # if set in code, but it is no longer a user-facing knob: UNO_DRAFT_INT4_GROUP was
-    # removed on 2026-11-18 along with W4A8. Per-channel scales only ever won on the W4A8
-    # path, where the int8 kernel could accumulate int32 over all of K and rescale once
-    # instead of once per group (one forward 6.31 vs 6.72 ms). On the W4A16 path they just
-    # lose accuracy and have no tuned table, so 128 is the only sensible value.
+    # INT4 scale group along K (Marlin accepts 32, 64, 128). Fixed since 2026-11-18, when
+    # UNO_DRAFT_INT4_GROUP and the per-channel (group = 0) path went away with W4A8:
+    # per-channel scales only ever won there, because the int8 kernel could then accumulate
+    # int32 over all of K and rescale once instead of once per group (one forward 6.31 vs
+    # 6.72 ms). On the W4A16 path they just lose accuracy and have no tuned table.
     group = 128
 
     def __init__(
@@ -478,11 +457,11 @@ class UnoMarlinDraftWeight:
         self.max_rows = int(os.environ.get("UNO_DRAFT_QUANT_MAX_ROWS", default_max_rows(kind)))
         self.humming = None
         self.humming_tuning = None
+        self.humming_min_rows = 0  # unused while self.humming is None; keep it defined
         self.out_features = weight.size(0)
         weight = _pad_rows(weight.detach(), 64)
         self.n, self.k = weight.shape
-        self.group = self.k if type(self).group == 0 else type(self).group
-        self.channel = self.group == self.k
+        self.group = type(self).group
         if self.k % self.group:
             raise ValueError(f"Marlin draft weights need K % {self.group} == 0, got K={self.k}")
         device = weight.device
@@ -548,7 +527,7 @@ class UnoMarlinDraftWeight:
         (identity rows give (q - 8) * s exactly in bf16)."""
         from sglang.srt.layers.quantization.marlin_utils import get_scale_perms
 
-        perm = torch.tensor(get_scale_perms()[1 if self.channel else 0], device=self.scales.device)
+        perm = torch.tensor(get_scale_perms()[0], device=self.scales.device)  # group scales
         scales = self.scales.reshape(-1, perm.numel())[:, torch.argsort(perm)].reshape(-1, self.n)
         codes = torch.empty(self.k, self.n, dtype=torch.int32, device=scales.device)
         step = 512
@@ -565,27 +544,17 @@ class UnoMarlinDraftWeight:
         from humming.layer import HummingLayer
 
         codes, scales = self.gptq_codes()
-        if self.channel:
-            # Humming's own schema: uint4 codes (zero at 8, as GPTQ sym) packed along K, [N, 1] scales.
-            weight_config = {"quant_method": "humming", "dtype": "int4", "group_size": 0}
-            tensors = {
-                "weight": _pack_int4_rows(codes).t().contiguous(),
-                "weight_scale": scales.t().contiguous().to(dtype),
-            }
-        else:
-            weight_config = {"quant_method": "gptq", "bits": 4, "group_size": self.group, "sym": True}
-            tensors = {"qweight": _pack_int4_rows(codes), "scales": scales.to(dtype)}
         layer = HummingLayer(
             shape_n=self.n,
             shape_k=self.k,
-            weight_config=weight_config,
+            weight_config={"quant_method": "gptq", "bits": 4, "group_size": self.group, "sym": True},
             input_config=None,  # weight-only: bf16 activations (W4A16)
             torch_dtype=dtype,
             pad_n_to_multiple=256,  # Humming's N tiles must divide N
         ).to(scales.device)
-        layer.load_from_tensors(tensors)
+        layer.load_from_tensors({"qweight": _pack_int4_rows(codes), "scales": scales.to(dtype)})
         layer.transform()
-        self.humming_tuning = _humming_tuning(layer, self.n, self.k, channel=self.channel)
+        self.humming_tuning = _humming_tuning(layer, self.n, self.k)
         return layer
 
     def _gemm(self, x: torch.Tensor, out=None) -> torch.Tensor:
