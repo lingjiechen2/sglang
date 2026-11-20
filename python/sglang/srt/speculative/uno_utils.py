@@ -593,6 +593,44 @@ def sample_uno_candidates(
     return candidates, draft_distribution
 
 
+def shift_uno_seed_into_verify(
+    *,
+    seed_tokens: torch.Tensor,  # [B]
+    candidates: torch.Tensor,  # [B, F] tokens of the F draft-pass rows
+    draft_logits: torch.Tensor | None,  # [B, F, V]; None for greedy
+    draft_distribution: UnoDraftDistribution | None,
+    sampling_info: Any,
+    max_top_k: int,
+    uniform_top_k_value: int | None = None,
+) -> tuple[torch.Tensor, UnoDraftDistribution | None]:
+    """Verify layout when the verify pass starts at the seed row (--uno-draft-kv-window).
+
+    The verify rows are ``[seed, c0 .. c_{F-2}]``: the seed row's token c0 is a proposal like the others, and the
+    last draft is dropped so the pass keeps F rows. This is the usual layout shifted by one token, so the usual
+    acceptance code applies with the seed in the always-accepted slot. q gains c0's row and loses the last one.
+    """
+    verify_candidates = torch.cat(
+        (seed_tokens.to(candidates.dtype)[:, None], candidates[:, :-1]), dim=1
+    )
+    if draft_distribution is None:
+        return verify_candidates, None
+    if draft_distribution.token_ids is not None:
+        raise NotImplementedError(
+            "--uno-draft-kv-window supports the dense sampling path only (top-k off)."
+        )
+    # c0 was sampled from this distribution (sample_uno_candidates, row 0).
+    seed_row_probs = _build_dense_probs(
+        next_token_logits=draft_logits[:, 0, :],
+        sampling_info=sampling_info,
+        batch_size=candidates.shape[0],
+        forward_width=1,
+        max_top_k=max_top_k,
+        uniform_top_k_value=uniform_top_k_value,
+    )
+    probs = torch.cat((seed_row_probs, draft_distribution.probs[:, :-1]), dim=1)
+    return verify_candidates, UnoDraftDistribution(probs=probs)
+
+
 def _sample_rectified_candidates(
     *,
     draft_logits: torch.Tensor,  # [B, F, V]
@@ -856,17 +894,19 @@ def simulate_uno_acceptance(
     simulate_acc_len: float,
     simulate_acc_method: str,
     simulate_acc_token_mode: str,
+    shift: int = 0,
     fixed_token_id: int = 100,
 ) -> tuple:
     """Force the tokens committed per round (SGLANG_SIMULATE_ACC_LEN benchmark knob), ignoring the verify result.
 
     Returns what the real acceptance returns: (output_ids [B, F + 1], accept_lens, new_seq_lens, correction).
-    A linear round commits between 2 and F + 1 tokens. One length is drawn per round for the whole batch.
+    A linear round commits ``accept_lens - shift`` tokens, between ``2 - shift`` and ``F + 1 - shift``; ``shift`` is 1
+    when the verify pass starts at the seed row. One length is drawn per round for the whole batch.
     "real-draft-token" keeps the draft tokens and takes the target argmax as the next seed; "fixed" emits one token id.
     """
     batch_size, forward_width = candidates.shape
-    commit = sample_simulated_acc_len(simulate_acc_len, simulate_acc_method, forward_width + 1)
-    accepted = max(commit, 2) - 2  # verified drafts kept after verify row 0
+    commit = sample_simulated_acc_len(simulate_acc_len, simulate_acc_method, forward_width + 1 - shift)
+    accepted = max(commit, 2 - shift) + shift - 2  # verified drafts kept after verify row 0
     output_ids = torch.zeros((batch_size, forward_width + 1), dtype=torch.int64, device=candidates.device)
     if simulate_acc_token_mode == "real-draft-token":
         correction = next_token_logits.view(batch_size, forward_width, -1)[:, accepted].argmax(dim=-1)

@@ -9,7 +9,7 @@ from sglang.srt.speculative.eagle_info import EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.srt.speculative.uno_draft_window import (
     check_layers,
-    draft_window_from_env,
+    draft_window,
     full_attention_backend,
 )
 from sglang.srt.speculative.uno_info import UnoForwardInput
@@ -165,10 +165,10 @@ class UnoDecodeCudaGraphRunner(DecodeCudaGraphRunner):
             self._capture_spec_input_type = SpecInputType.UNO_VERIFY
             self._lora_state.reset()
 
-        # Draft-only KV window (opt-in env, see uno_draft_window.py): linear UNO captures a separate "lora" graph for the
-        # draft pass and a "nolora" graph for the verify pass, so the window is baked into the draft graph only. The
-        # attention backend reads the window while the graph is traced; the verify graph is traced with it off.
-        window, layers = draft_window_from_env()
+        # Draft KV window (--uno-draft-kv-window, see uno_draft_window.py): linear UNO captures a separate "lora" graph
+        # for the draft pass and a "nolora" graph for the verify pass, so the window is baked into the draft graph only.
+        # The attention backend reads the window while the graph is traced; the verify graph is traced with it off.
+        window, layers = draft_window()
         full = None
         if window > 0:
             full = full_attention_backend(self.model_runner.attn_backend)

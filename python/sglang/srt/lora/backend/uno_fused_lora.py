@@ -51,6 +51,7 @@ def _uno_lora_expand_kernel(
     M,
     N,
     forward_width,
+    seed_lora,  # nonzero: the seed rows get LoRA too
     scaling,
     R: tl.constexpr,
     NUM_SLICES: tl.constexpr,
@@ -76,8 +77,8 @@ def _uno_lora_expand_kernel(
         col_slice += (cols >= tl.load(slice_ends + s)).to(tl.int32)
     col_block = tl.load(slice_blocks + col_slice, mask=col_mask, other=-1)
 
-    # The first row of every request is its seed token, which stays base-only.
-    lora_rows = row_mask & (rows % forward_width != 0)
+    # The first row of every request is its seed token, which stays base-only unless seed_lora.
+    lora_rows = row_mask & ((rows % forward_width != 0) | (seed_lora != 0))
     ranks = tl.arange(0, R)
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for block in tl.static_range(NUM_BLOCKS):
@@ -113,6 +114,7 @@ def _uno_lora_expand_silu_mul_kernel(
     M,
     inter,
     forward_width,
+    seed_lora,  # nonzero: the seed rows get LoRA too
     scaling,
     GATE_BLOCK: tl.constexpr,
     UP_BLOCK: tl.constexpr,
@@ -134,7 +136,7 @@ def _uno_lora_expand_silu_mul_kernel(
     col_mask = cols < inter
     rows64 = rows.to(tl.int64)
     cols64 = cols.to(tl.int64)
-    lora_rows = row_mask & (rows % forward_width != 0)
+    lora_rows = row_mask & ((rows % forward_width != 0) | (seed_lora != 0))
     ranks = tl.arange(0, R)
     a_base = full + rows64[:, None] * full_row_stride + 2 * inter + ranks[None, :]
     h_gate = tl.load(a_base + GATE_BLOCK * R, mask=lora_rows[:, None], other=0.0)
@@ -194,7 +196,7 @@ class UnoFusedLoRA(msgspec.Struct, frozen=True):
         """The folded layers' base outputs only (no LoRA), as one GEMM."""
         return torch.mm(x, self.weight_cat[: self.out_features].t())
 
-    def forward_silu_mul(self, x: torch.Tensor, *, forward_width: int) -> torch.Tensor:
+    def forward_silu_mul(self, x: torch.Tensor, *, forward_width: int, seed_lora: bool = False) -> torch.Tensor:
         """silu(gate) * up of a folded two-slice gate_up layer, in one pass."""
         full = self._draft_gemm(x)
         if self.rank == 0:
@@ -220,6 +222,7 @@ class UnoFusedLoRA(msgspec.Struct, frozen=True):
             rows,
             inter,
             forward_width,
+            int(seed_lora),
             self.scaling,
             GATE_BLOCK=self.gate_up_blocks[0],
             UP_BLOCK=self.gate_up_blocks[1],
@@ -232,7 +235,7 @@ class UnoFusedLoRA(msgspec.Struct, frozen=True):
         )
         return out
 
-    def forward(self, x: torch.Tensor, *, forward_width: int) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *, forward_width: int, seed_lora: bool = False) -> torch.Tensor:
         full = self._draft_gemm(x)
         if self.rank == 0:
             # Base-only fold of a layer the adapter skips (--uno-draft-quant-skipped): no LoRA.
@@ -258,6 +261,7 @@ class UnoFusedLoRA(msgspec.Struct, frozen=True):
             rows,
             self.out_features,
             forward_width,
+            int(seed_lora),
             self.scaling,
             R=self.rank,
             NUM_SLICES=self.num_slices,

@@ -48,7 +48,7 @@ from sglang.srt.speculative.uno_cuda_graph_runner import (
 )
 from sglang.srt.speculative.uno_draft_window import (
     check_layers,
-    draft_window_from_env,
+    draft_window,
     full_attention_backend,
 )
 from sglang.srt.speculative.uno_info import UnoDraftInput, UnoForwardInput
@@ -63,6 +63,7 @@ from sglang.srt.speculative.uno_utils import (
     run_uno_sampling,
     sample_uno_candidates,
     sample_uno_clean_root,
+    shift_uno_seed_into_verify,
     simulate_uno_acceptance,
     uno_mamba_track_steps,
 )
@@ -174,13 +175,13 @@ class UnoWorkerV2(BaseSpecWorker):
         # init_attention_backends(), after those pools exist.
         self._uno_draft_attn_backend = None
         self._uno_draft_cuda_graph_runner = None
-        # Draft-only KV window in tokens (opt-in env UNO_DRAFT_KV_WINDOW, 0 = off = unchanged behaviour). Linear UNO
-        # runs draft and verify on the same backend, so the window is switched on only around the draft pass (eager
-        # path) and baked into the draft ("lora") CUDA graph only (UnoDecodeCudaGraphRunner.capture_one_shape); tree
-        # UNO sets it once on its private draft backend.
-        # Optional layer selection (UNO_DRAFT_KV_WINDOW_LAYERS="0,2,4-34", 0-based): only these layers get the
-        # window; unset/empty = every layer.
-        self._uno_draft_window, self._uno_draft_window_layers = draft_window_from_env()
+        # Draft KV window in tokens (--uno-draft-kv-window, 0 = off; see uno_draft_window.py). Linear UNO runs draft
+        # and verify on the same backend, so the window is switched on only around the draft pass (eager path) and
+        # baked into the draft ("lora") CUDA graph only (UnoDecodeCudaGraphRunner.capture_one_shape). With a window
+        # the seed row is windowed and carries the adapter too, and the verify pass starts at the seed row.
+        self._uno_draft_window, self._uno_draft_window_layers = draft_window()
+        self._uno_window_seed = self._uno_draft_window > 0
+        self._uno_seed_lora_id = self.uno_lora_id if self._uno_window_seed else None
         if SIMULATE_ACC_LEN > 0 and self.tree_mode:
             raise NotImplementedError("SGLANG_SIMULATE_ACC_LEN supports linear UNO only.")
         self.plan_stream, self.plan_stream_ctx = (
@@ -256,16 +257,14 @@ class UnoWorkerV2(BaseSpecWorker):
 
         if self._private_draft:
             self._uno_draft_attn_backend = self._build_uno_draft_attn_backend()
-            if self._uno_draft_window > 0:
-                # The private tree-draft backend never runs the verify pass, so the window can stay on.
-                full = self._draft_window_backend(self._uno_draft_attn_backend)
-                full.uno_draft_window = self._uno_draft_window
-                logger.info("UNO draft KV window: %d tokens (tree draft backend).", self._uno_draft_window)
         # Linear-attention layers keep a recurrent state that TARGET_VERIFY
         # never advances; UNO commits it after each of its two passes.
         self._commits_mamba_state = (
             mambaish_config(self.model_runner.model_config) is not None
         )
+        if self._commits_mamba_state and self._uno_window_seed:
+            # The windowed seed row would advance the recurrent state from a windowed input.
+            raise NotImplementedError("--uno-draft-kv-window does not support linear-attention models yet.")
         if (
             self._commits_mamba_state
             and self.tree_mode
@@ -1073,13 +1072,28 @@ class UnoWorkerV2(BaseSpecWorker):
             )
             self._sync_tp(candidates=candidates)
 
-        verify_prefix_lens = committed_seq_lens + 1
+        # Usual layout: the seed row stays from the draft pass and verify covers the F tokens after it. With the
+        # window the seed row was windowed, so verify starts at the seed row instead: the same layout shifted back
+        # by one token, and the seed row's token c0 becomes a verified draft.
+        shift = 1 if self._uno_window_seed else 0
+        if shift:
+            candidates, draft_distribution = shift_uno_seed_into_verify(
+                seed_tokens=seed_tokens,
+                candidates=candidates,
+                draft_logits=None if all_greedy else draft_logits,
+                draft_distribution=None if all_greedy else draft_distribution,
+                sampling_info=sampling_info,
+                max_top_k=max_top_k,
+                uniform_top_k_value=uniform_top_k_value,
+            )
+            self._sync_tp(candidates=candidates)
+        accept_base = committed_seq_lens - shift
         verify_forward_batch = self._make_forward_batch(
             spec_input_type=SpecInputType.UNO_VERIFY,
             input_ids=candidates,
-            positions=logical_positions[:, 1:],
-            out_cache_loc=tail_locs[:, 1:],
-            prefix_lens=verify_prefix_lens,
+            positions=logical_positions[:, 1 - shift : self.tail_width - shift],
+            out_cache_loc=tail_locs[:, 1 - shift : self.tail_width - shift],
+            prefix_lens=accept_base + 1,
             seq_lens_cpu=verify_seq_lens_cpu,
             seq_lens_sum=verify_seq_lens_sum,
             req_pool_indices=batch.req_pool_indices,
@@ -1093,14 +1107,14 @@ class UnoWorkerV2(BaseSpecWorker):
             output_ids, accept_lens, new_seq_lens, correction = self._accept_and_pack(
                 candidates=candidates,
                 target_top1=target_top1,
-                committed_seq_lens=committed_seq_lens,
+                committed_seq_lens=accept_base,
             )
         else:
             sampling_result = run_uno_sampling(
                 candidates=candidates,
                 next_token_logits=verify_result.logits_output.next_token_logits,
                 sampling_info=sampling_info,
-                committed_frontiers=committed_seq_lens,
+                committed_frontiers=accept_base,
                 draft_distribution=draft_distribution,
                 max_top_k=max_top_k,
                 uniform_top_k_value=uniform_top_k_value,
@@ -1121,10 +1135,11 @@ class UnoWorkerV2(BaseSpecWorker):
             output_ids, accept_lens, new_seq_lens, correction = simulate_uno_acceptance(
                 candidates=candidates,
                 next_token_logits=verify_result.logits_output.next_token_logits,
-                committed_seq_lens=committed_seq_lens,
+                committed_seq_lens=accept_base,
                 simulate_acc_len=SIMULATE_ACC_LEN,
                 simulate_acc_method=SIMULATE_ACC_METHOD,
                 simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
+                shift=shift,
             )
             self._sync_tp(
                 output_ids=output_ids,
@@ -1132,6 +1147,11 @@ class UnoWorkerV2(BaseSpecWorker):
                 new_seq_lens=new_seq_lens,
                 correction=correction,
             )
+
+        if shift:
+            # Slot 0 is the seed, which the previous round already emitted.
+            output_ids = torch.nn.functional.pad(output_ids[:, 1:], (0, 1))
+            accept_lens = accept_lens - 1
 
         if self.recycle:
             tail, tail_lens = extract_uno_recycle_tail(candidates, accept_lens)
@@ -1162,7 +1182,7 @@ class UnoWorkerV2(BaseSpecWorker):
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=self.forward_width,
             speculative_output_stride=self.tail_width,
-            num_non_draft_tokens_per_req=2,
+            num_non_draft_tokens_per_req=2 - shift,
             new_seq_lens=new_seq_lens,
             can_run_cuda_graph=verify_result.can_run_cuda_graph,
             routed_experts_output=verify_result.routed_experts_output,
@@ -1396,7 +1416,7 @@ class UnoWorkerV2(BaseSpecWorker):
                 and graph_runner.can_run_graph(forward_batch)
             ):
                 self.lora_manager.prepare_lora_token_segments(
-                    lora_ids=[None, self.uno_lora_id] * batch_size,
+                    lora_ids=[self._uno_seed_lora_id, self.uno_lora_id] * batch_size,
                     segment_lens=[1, self.draft_width - 1] * batch_size,
                 )
             result = self._run_target_block(

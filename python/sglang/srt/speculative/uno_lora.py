@@ -396,11 +396,15 @@ class UnoCudaGraphLoRAState:
         self.uno_lora_id = uno_lora_id
         self.forward_width = forward_width
         self._draft_batch_infos = {}
+        from sglang.srt.speculative.uno_draft_window import draft_window
+
+        # --uno-draft-kv-window: the windowed seed row carries the adapter too.
+        self._seed_lora_id = uno_lora_id if draft_window()[0] > 0 else None
 
     def capture_draft(self, batch_size: int) -> None:
         if batch_size not in self._draft_batch_infos:
             self.manager.prepare_lora_token_segments(
-                lora_ids=[None, self.uno_lora_id] * batch_size,
+                lora_ids=[self._seed_lora_id, self.uno_lora_id] * batch_size,
                 segment_lens=[1, self.forward_width - 1] * batch_size,
             )
             batch_info = self.manager.lora_backend.batch_info

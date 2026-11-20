@@ -27,11 +27,15 @@ class _UnoSingleAdapterRoute:
     forward_width: int
     total_rows: int
     active_rows: int
+    # The seed rows carry the adapter too (--uno-draft-kv-window): every row is a LoRA row.
+    seed_lora: bool = False
 
     @property
     def lora_rows(self) -> int:
         # For C=1, skipping the seed row makes both GEMMs smaller. For C>1,
         # one GEMM across C*F rows is faster than C tiny (F-1)-row GEMMs.
+        if self.seed_lora:
+            return self.total_rows
         return self.active_rows if self.batch_size == 1 else self.total_rows
 
 
@@ -146,9 +150,10 @@ class UnoCublasLoRABackend(TritonLoRABackend):
             forward_width = segment_lens[1] + 1
             base_index, adapter_index = weight_indices[:2]
             adapter_rank = lora_ranks[adapter_index]
+            # Seed rows routed to the adapter as well: same layout, no base-only row.
+            seed_lora = base_index == adapter_index
             if (
-                base_index != adapter_index
-                and lora_ranks[base_index] == 0
+                (seed_lora or lora_ranks[base_index] == 0)
                 and adapter_rank > 0
                 and all(
                     segment_lens[2 * index] == 1
@@ -166,6 +171,7 @@ class UnoCublasLoRABackend(TritonLoRABackend):
                     forward_width=forward_width,
                     total_rows=sum(segment_lens),
                     active_rows=batch_size * (forward_width - 1),
+                    seed_lora=seed_lora,
                 )
 
         # Each CUDA-graph bucket retains its own batch_info. Store the immutable
@@ -190,7 +196,7 @@ class UnoCublasLoRABackend(TritonLoRABackend):
         x: torch.Tensor,
         route: _UnoSingleAdapterRoute,
     ) -> torch.Tensor:
-        if route.batch_size == 1:
+        if route.batch_size == 1 and not route.seed_lora:
             return x[1:]
         return x
 
@@ -203,7 +209,7 @@ class UnoCublasLoRABackend(TritonLoRABackend):
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         hidden = torch.mm(lora_input, active_a.t(), out=output)
-        if route.batch_size > 1:
+        if route.batch_size > 1 and not route.seed_lora:
             # LoRA must not affect each request's seed token. Zeroing C rows
             # is cheaper than masking every hidden element or running C tiny
             # strided-batched GEMMs.
@@ -220,7 +226,7 @@ class UnoCublasLoRABackend(TritonLoRABackend):
         output_end: int,
         route: _UnoSingleAdapterRoute,
     ) -> None:
-        if route.batch_size == 1:
+        if route.batch_size == 1 and not route.seed_lora:
             base_output[1:, output_start:output_end].addmm_(
                 hidden,
                 active_b.t(),
@@ -448,11 +454,13 @@ class UnoCublasLoRABackend(TritonLoRABackend):
 
     def run_uno_fused_lora(self, fused, x: torch.Tensor) -> torch.Tensor:
         """One folded base+LoRA-A GEMM and the LoRA-B expand (``--uno-fused-lora``)."""
-        return fused.forward(x, forward_width=self._route().forward_width)
+        route = self._route()
+        return fused.forward(x, forward_width=route.forward_width, seed_lora=route.seed_lora)
 
     def run_uno_fused_lora_silu_mul(self, fused, x: torch.Tensor) -> torch.Tensor:
         """Folded gate_up GEMM plus LoRA-B expand fused with SiLU*mul."""
-        return fused.forward_silu_mul(x, forward_width=self._route().forward_width)
+        route = self._route()
+        return fused.forward_silu_mul(x, forward_width=route.forward_width, seed_lora=route.seed_lora)
 
     def _consume_lora_a_overlap(
         self,

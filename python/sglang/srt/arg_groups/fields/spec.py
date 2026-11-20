@@ -111,6 +111,22 @@ class Spec(msgspec.Struct):
         "fails if the file is missing or the model has no MoVA attention. "
         "Base-only forwards are unchanged.",
     ] = False
+    uno_draft_kv_window: A[
+        int,
+        "Draft KV window (context trimming) for linear UNO, in tokens; 0 (default) is off. "
+        "Every row of the draft pass, the seed row included, reads only the last W keys and "
+        "the seed row carries the draft adapter, so the draft pass never reads the KV cache "
+        "outside the window. The verify pass then starts at the seed row and recomputes it "
+        "with the full context, so committed tokens still follow the target model. Needs a "
+        "pure-attention model with the FlashAttention backend, linear UNO, dense sampling "
+        "(top-k off), no recycle and no draft weight quantization, and an adapter trained "
+        "with a windowed seed row.",
+    ] = 0
+    uno_draft_kv_window_layers: A[
+        Optional[str],
+        "With --uno-draft-kv-window: apply the window only to these decoder layers "
+        '(0-based ids and ranges, e.g. "0,2,4-34"). Unset (default) is every layer.',
+    ] = None
     speculative_draft_model_path: A[
         Optional[str],
         Arg(

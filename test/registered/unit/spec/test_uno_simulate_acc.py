@@ -13,14 +13,14 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 B, F, V = 3, 8, 50
 
 
-def run(acc_len, mode="real-draft-token"):
+def run(acc_len, shift=0, mode="real-draft-token"):
     torch.manual_seed(0)
     candidates = torch.randint(0, V, (B, F))
     logits = torch.randn(B * F, V)
     seq = torch.tensor([10, 20, 30], dtype=torch.int32)
     out = simulate_uno_acceptance(
         candidates=candidates, next_token_logits=logits, committed_seq_lens=seq, simulate_acc_len=acc_len,
-        simulate_acc_method="match-expected", simulate_acc_token_mode=mode)
+        simulate_acc_method="match-expected", simulate_acc_token_mode=mode, shift=shift)
     return candidates, logits.view(B, F, V), seq, out
 
 
@@ -34,9 +34,17 @@ class TestUnoSimulateAcc(CustomTestCase):
         self.assertTrue(torch.equal(output_ids[:, 3], correction))
         self.assertEqual(tuple(output_ids.shape), (B, F + 1))
 
+    def test_seed_shift_commits_the_same_count(self):
+        # With the verify pass starting at the seed row the caller drops slot 0 and one from accept_lens.
+        _, _, _, (_, accept_lens, new_seq_lens, _) = run(4.0, shift=1)
+        self.assertEqual((accept_lens - 1).tolist(), [4] * B)
+        self.assertEqual(new_seq_lens.tolist(), [15, 25, 35])  # frontier passed in is one behind
+
     def test_bounds(self):
         self.assertEqual(run(1.0)[3][1].tolist(), [2] * B)  # a round always commits candidates[0] + correction
+        self.assertEqual((run(1.0, shift=1)[3][1] - 1).tolist(), [1] * B)
         self.assertEqual(run(99.0)[3][1].tolist(), [F + 1] * B)
+        self.assertEqual((run(99.0, shift=1)[3][1] - 1).tolist(), [F] * B)
 
     def test_fractional_length_matches_in_expectation(self):
         torch.manual_seed(1)
