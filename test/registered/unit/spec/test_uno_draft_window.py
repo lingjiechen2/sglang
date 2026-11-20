@@ -61,6 +61,24 @@ class TestUnoDraftWindow(CustomTestCase):
         with self.assertRaises(RuntimeError):
             full_attention_backend(SimpleNamespace())
 
+    def test_seed_shift_keeps_c0_row_dense_and_sparse(self):
+        import torch
+
+        from sglang.srt.speculative.uno_utils import UnoDraftDistribution, shift_uno_seed_into_verify
+
+        batch, width, k = 2, 4, 3
+        seed = torch.tensor([7, 9])
+        cands = torch.arange(batch * width).view(batch, width)
+        probs = torch.rand(batch, width, k)
+        ids = torch.randint(0, 50, (batch, width, k))
+        for dist in (UnoDraftDistribution(probs=probs), UnoDraftDistribution(probs=probs, token_ids=ids)):
+            out, q = shift_uno_seed_into_verify(seed_tokens=seed, candidates=cands, draft_distribution=dist)
+            self.assertTrue(torch.equal(out, torch.cat((seed[:, None], cands[:, :-1]), dim=1)))
+            self.assertTrue(torch.equal(q.probs, probs[:, :-1]))
+            self.assertTrue(q.token_ids is None if dist.token_ids is None else torch.equal(q.token_ids, ids[:, :-1]))
+        out, q = shift_uno_seed_into_verify(seed_tokens=seed, candidates=cands, draft_distribution=None)
+        self.assertIsNone(q)
+
 
 if __name__ == "__main__":
     unittest.main()

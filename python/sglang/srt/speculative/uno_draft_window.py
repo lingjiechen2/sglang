@@ -1,10 +1,11 @@
-"""Draft KV window (context trimming) for linear UNO: --uno-draft-kv-window / --uno-draft-kv-window-layers.
+"""Draft KV window (context trimming) for UNO: --uno-draft-kv-window / --uno-draft-kv-window-layers.
 
 With a window W > 0, every row of the draft pass -- the seed row included -- reads only the last W keys, so the draft
 pass is one attention call that never touches keys outside the window, and the seed row carries the draft adapter.
 The verify pass then starts at the seed row and recomputes it with the full context (its K/V are overwritten); the
-seed row's token becomes a verified draft instead of a free token. --uno-draft-kv-window-layers "0,2,4-6" (0-based)
-restricts the window to those layers; unset = every layer.
+seed row's token becomes a verified draft instead of a free token. Tree UNO does the same through its seed-root
+layout: the seed is the verify tree's root and the clean row its first level (Q >= F + 1).
+--uno-draft-kv-window-layers "0,2,4-6" (0-based) restricts the window to those layers; unset = every layer.
 """
 
 from __future__ import annotations

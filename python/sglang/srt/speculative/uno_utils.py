@@ -597,38 +597,25 @@ def shift_uno_seed_into_verify(
     *,
     seed_tokens: torch.Tensor,  # [B]
     candidates: torch.Tensor,  # [B, F] tokens of the F draft-pass rows
-    draft_logits: torch.Tensor | None,  # [B, F, V]; None for greedy
-    draft_distribution: UnoDraftDistribution | None,
-    sampling_info: Any,
-    max_top_k: int,
-    uniform_top_k_value: int | None = None,
+    draft_distribution: UnoDraftDistribution | None,  # F rows (include_clean=True); None for greedy
 ) -> tuple[torch.Tensor, UnoDraftDistribution | None]:
     """Verify layout when the verify pass starts at the seed row (--uno-draft-kv-window).
 
     The verify rows are ``[seed, c0 .. c_{F-2}]``: the seed row's token c0 is a proposal like the others, and the
     last draft is dropped so the pass keeps F rows. This is the usual layout shifted by one token, so the usual
-    acceptance code applies with the seed in the always-accepted slot. q gains c0's row and loses the last one.
+    acceptance code applies with the seed in the always-accepted slot. ``draft_distribution`` holds the q of all F
+    rows (sampled with ``include_clean=True``), so q keeps c0's row and drops the last one, dense or sparse alike.
     """
     verify_candidates = torch.cat(
         (seed_tokens.to(candidates.dtype)[:, None], candidates[:, :-1]), dim=1
     )
     if draft_distribution is None:
         return verify_candidates, None
-    if draft_distribution.token_ids is not None:
-        raise NotImplementedError(
-            "--uno-draft-kv-window supports the dense sampling path only (top-k off)."
-        )
-    # c0 was sampled from this distribution (sample_uno_candidates, row 0).
-    seed_row_probs = _build_dense_probs(
-        next_token_logits=draft_logits[:, 0, :],
-        sampling_info=sampling_info,
-        batch_size=candidates.shape[0],
-        forward_width=1,
-        max_top_k=max_top_k,
-        uniform_top_k_value=uniform_top_k_value,
+    token_ids = draft_distribution.token_ids
+    return verify_candidates, UnoDraftDistribution(
+        probs=draft_distribution.probs[:, :-1],
+        token_ids=None if token_ids is None else token_ids[:, :-1],
     )
-    probs = torch.cat((seed_row_probs, draft_distribution.probs[:, :-1]), dim=1)
-    return verify_candidates, UnoDraftDistribution(probs=probs)
 
 
 def _sample_rectified_candidates(

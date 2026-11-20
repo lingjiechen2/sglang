@@ -113,14 +113,14 @@ class Spec(msgspec.Struct):
     ] = False
     uno_draft_kv_window: A[
         int,
-        "Draft KV window (context trimming) for linear UNO, in tokens; 0 (default) is off. "
+        "Draft KV window (context trimming) for UNO, in tokens; 0 (default) is off. "
         "Every row of the draft pass, the seed row included, reads only the last W keys and "
         "the seed row carries the draft adapter, so the draft pass never reads the KV cache "
         "outside the window. The verify pass then starts at the seed row and recomputes it "
-        "with the full context, so committed tokens still follow the target model. Needs a "
-        "pure-attention model with the FlashAttention backend, linear UNO, dense sampling "
-        "(top-k off), no recycle and no draft weight quantization, and an adapter trained "
-        "with a windowed seed row.",
+        "with the full context, so committed tokens still follow the target model (tree UNO: "
+        "the seed is the verify tree's root, Q >= F + 1). Needs a pure-attention model with "
+        "the FlashAttention backend, no recycle "
+        "and no draft weight quantization, and an adapter trained with a windowed seed row.",
     ] = 0
     uno_draft_kv_window_layers: A[
         Optional[str],

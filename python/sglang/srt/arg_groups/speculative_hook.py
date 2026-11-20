@@ -525,11 +525,13 @@ def _handle_uno(server_args: ServerArgs) -> None:
             raise ValueError(
                 f"UNO tree mode requires Q >= F; got Q={verify_width}, F={draft_width}."
             )
-        if cfg.uno_draft_weight_quant != "none" and verify_width < draft_width + 1:
+        # Quantized or windowed drafts verify the seed as the tree root (seed-root trees).
+        seed_root = cfg.uno_draft_weight_quant != "none" or bool(cfg.uno_draft_kv_window)
+        if seed_root and verify_width < draft_width + 1:
             # Seed-root trees hold the seed plus a chain through all F draft rows.
             raise ValueError(
-                "UNO tree mode with --uno-draft-weight-quant requires Q >= F + 1; "
-                f"got Q={verify_width}, F={draft_width}."
+                "UNO tree mode with --uno-draft-weight-quant or --uno-draft-kv-window requires "
+                f"Q >= F + 1; got Q={verify_width}, F={draft_width}."
             )
         if verify_width > 128:
             raise ValueError(
@@ -543,8 +545,8 @@ def _handle_uno(server_args: ServerArgs) -> None:
                 f"Q*K={verify_width}*{candidate_top_k}={frontier_slots}."
             )
 
-        # Seed-root trees (quantized drafts) have one more level: the clean row.
-        tree_levels = speculative_num_steps + (1 if cfg.uno_draft_weight_quant != "none" else 0)
+        # Seed-root trees have one more level: the clean row.
+        tree_levels = speculative_num_steps + (1 if seed_root else 0)
         tree_capacity = 1
         nodes_at_depth = 1
         for _ in range(tree_levels):
@@ -607,15 +609,10 @@ def _handle_uno(server_args: ServerArgs) -> None:
         parse_layer_ids(cfg.uno_draft_kv_window_layers)
         if int(cfg.uno_draft_kv_window or 0) <= 0:
             raise ValueError("--uno-draft-kv-window must be > 0 (and is needed by --uno-draft-kv-window-layers).")
-        if (
-            candidate_top_k > 1
-            or cfg.uno_enable_recycle
-            or cfg.uno_mova_lora
-            or cfg.uno_draft_weight_quant != "none"
-        ):
+        if cfg.uno_enable_recycle or cfg.uno_mova_lora or cfg.uno_draft_weight_quant != "none":
             raise ValueError(
-                "--uno-draft-kv-window supports linear UNO (--speculative-eagle-topk 1) without "
-                "--uno-enable-recycle, --uno-mova-lora or --uno-draft-weight-quant."
+                "--uno-draft-kv-window does not support --uno-enable-recycle, --uno-mova-lora or "
+                "--uno-draft-weight-quant."
             )
     if cfg.tp_size > 1 and cfg.uno_fused_lora:
         raise ValueError("--uno-fused-lora needs TP=1 for now.")

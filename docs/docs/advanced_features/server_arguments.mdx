@@ -1620,7 +1620,7 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--uno-draft-kv-window`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>UNO only. Draft KV window (context trimming) in tokens; 0 is off. Every row of the draft pass, the seed row included, reads only the last W keys and the seed row carries the draft adapter; the verify pass starts at the seed row and recomputes it with the full context, so committed tokens still follow the target model. Needs a pure-attention model with the FlashAttention backend, linear UNO, dense sampling (top-k off), no recycle, no MoVA LoRA and no draft weight quantization, and an adapter trained with a windowed seed row.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>UNO only. Draft KV window (context trimming) in tokens; 0 is off. Every row of the draft pass, the seed row included, reads only the last W keys and the seed row carries the draft adapter; the verify pass starts at the seed row and recomputes it with the full context, so committed tokens still follow the target model (tree UNO: the seed is the verify tree's root, Q >= F + 1). Needs a pure-attention model with the FlashAttention backend, no recycle, no MoVA LoRA and no draft weight quantization, and an adapter trained with a windowed seed row.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`0`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
     </tr>

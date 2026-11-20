@@ -129,10 +129,21 @@ class UnoWorkerV2(BaseSpecWorker):
         # [seed, clean, drafts], and the draft runs draft_width = F rows.
         self.draft_weight_quant = get_spec().uno_draft_weight_quant
         self.seed_in_verify = (not self.tree_mode) and self.draft_weight_quant != "none"
-        # Tree mode with a quantized draft cannot take the seed's KV, GDN inputs or
-        # the clean token from the draft: the seed becomes the verify tree's root
-        # and the clean row the first tree level (Q >= F + 1).
-        self.tree_seed_root = self.tree_mode and self.draft_weight_quant != "none"
+        # Draft KV window in tokens (--uno-draft-kv-window, 0 = off; see uno_draft_window.py). With a window the seed
+        # row is windowed and carries the adapter too, so its KV is recomputed by the verify pass. Linear UNO runs
+        # draft and verify on the same backend, so the window is switched on only around the draft pass (eager path)
+        # and baked into the draft ("lora") CUDA graph only (UnoDecodeCudaGraphRunner.capture_one_shape); the verify
+        # pass starts at the seed row. Tree UNO keeps the window on its private draft backend and verifies the seed
+        # as the tree root.
+        self._uno_draft_window, self._uno_draft_window_layers = draft_window()
+        self._uno_window_seed = self._uno_draft_window > 0
+        self._uno_seed_lora_id = self.uno_lora_id if self._uno_window_seed else None
+        # Tree mode with a quantized or windowed draft cannot take the seed's KV, GDN
+        # inputs or the clean token from the draft: the seed becomes the verify tree's
+        # root and the clean row the first tree level (Q >= F + 1).
+        self.tree_seed_root = self.tree_mode and (
+            self.draft_weight_quant != "none" or self._uno_window_seed
+        )
         # Above this many draft rows every draft GEMM and lm_head run in bf16, the
         # draft is exact, and the cheaper clean-root tree applies again (chosen per
         # batch; see UnoTreeGdnState.dynamic).
@@ -175,13 +186,6 @@ class UnoWorkerV2(BaseSpecWorker):
         # init_attention_backends(), after those pools exist.
         self._uno_draft_attn_backend = None
         self._uno_draft_cuda_graph_runner = None
-        # Draft KV window in tokens (--uno-draft-kv-window, 0 = off; see uno_draft_window.py). Linear UNO runs draft
-        # and verify on the same backend, so the window is switched on only around the draft pass (eager path) and
-        # baked into the draft ("lora") CUDA graph only (UnoDecodeCudaGraphRunner.capture_one_shape). With a window
-        # the seed row is windowed and carries the adapter too, and the verify pass starts at the seed row.
-        self._uno_draft_window, self._uno_draft_window_layers = draft_window()
-        self._uno_window_seed = self._uno_draft_window > 0
-        self._uno_seed_lora_id = self.uno_lora_id if self._uno_window_seed else None
         if SIMULATE_ACC_LEN > 0 and self.tree_mode:
             raise NotImplementedError("SGLANG_SIMULATE_ACC_LEN supports linear UNO only.")
         self.plan_stream, self.plan_stream_ctx = (
@@ -257,6 +261,12 @@ class UnoWorkerV2(BaseSpecWorker):
 
         if self._private_draft:
             self._uno_draft_attn_backend = self._build_uno_draft_attn_backend()
+            if self._uno_window_seed and self.tree_mode:
+                # The private tree-draft backend never runs the verify pass, so the window stays on (and is traced
+                # into the tree-draft CUDA graph, captured after this).
+                self._draft_window_backend(self._uno_draft_attn_backend).uno_draft_window = self._uno_draft_window
+                logger.info("UNO draft KV window: %d tokens (tree draft backend, seed-root verify).",
+                            self._uno_draft_window)
         # Linear-attention layers keep a recurrent state that TARGET_VERIFY
         # never advances; UNO commits it after each of its two passes.
         self._commits_mamba_state = (
@@ -1058,6 +1068,7 @@ class UnoWorkerV2(BaseSpecWorker):
                 max_top_k=max_top_k,
                 uniform_top_k_value=uniform_top_k_value,
                 rectifier=self.rectifier,
+                include_clean=self._uno_window_seed,
             )
             self._sync_tp(candidates=candidates)
         elif self.rectifier is not None:
@@ -1080,11 +1091,7 @@ class UnoWorkerV2(BaseSpecWorker):
             candidates, draft_distribution = shift_uno_seed_into_verify(
                 seed_tokens=seed_tokens,
                 candidates=candidates,
-                draft_logits=None if all_greedy else draft_logits,
                 draft_distribution=None if all_greedy else draft_distribution,
-                sampling_info=sampling_info,
-                max_top_k=max_top_k,
-                uniform_top_k_value=uniform_top_k_value,
             )
             self._sync_tp(candidates=candidates)
         accept_base = committed_seq_lens - shift
